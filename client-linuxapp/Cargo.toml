@@ -1,3 +1,7 @@
+# Copyright (c) 2021, Red Hat, Inc.
+# Copyright (c) 2026, Dell Technologies, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
 [package]
 name = "fdo-client-linuxapp"
 version = "0.5.5"
@@ -20,7 +24,12 @@ libcryptsetup-rs = { version = ">= 0.11.2", features = ["mutex"] }
 secrecy = "0.8"
 devicemapper = "0.34"
 openssl = "0.10.72"
+serde_cbor = "0.11"
 
 fdo-data-formats = { path = "../data-formats", version = "0.5.5" }
 fdo-http-wrapper = { path = "../http-wrapper", version = "0.5.5", features = ["client"] }
 fdo-util = { path = "../util", version = "0.5.5" }
+
+[features]
+default = ["delegate_support"]
+delegate_support = ["fdo-data-formats/delegate_support"]

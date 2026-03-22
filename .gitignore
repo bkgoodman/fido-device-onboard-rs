@@ -23,3 +23,5 @@ fido-device-onboard-rs-*-vendor-patched.tar.xz
 
 # SQLite test files
 *.sqlite
+ephemeral-test-files/
+.gitignore

@@ -1,3 +1,7 @@
+// Copyright (c) 2021, Red Hat, Inc.
+// Copyright (c) 2026, Dell Technologies, Inc.
+// SPDX-License-Identifier: BSD-3-Clause
+
 use std::process::{Command, Stdio};
 use std::{
     collections::HashSet,
@@ -13,10 +17,10 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use fdo_data_formats::{
     constants::{
-        FedoraIotServiceInfoModule, HashType, RedHatComServiceInfoModule, ServiceInfoModule,
-        StandardServiceInfoModule,
+        FdoServiceInfoModule, FedoraIotServiceInfoModule, HashType, RedHatComServiceInfoModule,
+        ServiceInfoModule, StandardServiceInfoModule,
     },
-    messages::v11::to2::{DeviceServiceInfo, OwnerServiceInfo},
+    messages::v20::to2::{DeviceSvcInfo20, OwnerSvcInfo20},
     types::{CborSimpleTypeExt, Hash, ServiceInfo},
 };
 use fdo_http_wrapper::client::{RequestResult, ServiceClient};
@@ -32,6 +36,7 @@ fn find_available_modules() -> Result<Vec<ServiceInfoModule>> {
         FedoraIotServiceInfoModule::BinaryFile.into(),
         FedoraIotServiceInfoModule::Command.into(),
         FedoraIotServiceInfoModule::Reboot.into(),
+        FdoServiceInfoModule::Bmo.into(),
     ];
 
     // See if we add RHSM
@@ -446,9 +451,226 @@ impl CommandInProgress {
     }
 }
 
-async fn process_serviceinfo_in(si_in: &ServiceInfo, si_out: &mut ServiceInfo) -> Result<bool> {
-    let mut active_modules: HashSet<ServiceInfoModule> = HashSet::new();
+// BMO (Bare Metal Onboarding) FSIM state
+//
+// Handles chunked image transfer from owner to device:
+//   image-begin (CBOR map) -> image-ack -> image-data-N... -> image-end -> image-result
+// Also handles BIOS parameter setting:
+//   set (CBOR array of [name, value]) -> response
 
+const BMO_DELIVERY_MODE_INLINE: u64 = 0;
+
+#[derive(Debug)]
+struct BmoImageBegin {
+    image_type: String,
+    total_size: Option<u64>,
+    hash_alg: Option<String>,
+    require_ack: bool,
+    delivery_mode: u64,
+    name: Option<String>,
+    version: Option<String>,
+    description: Option<String>,
+    boot_args: Option<String>,
+    url: Option<String>,
+}
+
+#[derive(Debug)]
+struct BmoInProgress {
+    begin: Option<BmoImageBegin>,
+    data: Vec<u8>,
+    output_dir: PathBuf,
+}
+
+impl BmoInProgress {
+    fn new() -> Self {
+        let output_dir = env::var("BMO_OUTPUT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp/fdo-bmo"));
+        BmoInProgress {
+            begin: None,
+            data: Vec::new(),
+            output_dir,
+        }
+    }
+
+    fn parse_image_begin(value: &serde_cbor::Value) -> Result<BmoImageBegin> {
+        let map = match value {
+            serde_cbor::Value::Map(m) => m,
+            _ => bail!("BMO image-begin: expected CBOR map, got {:?}", value),
+        };
+
+        let get_int = |key: i128| -> Option<&serde_cbor::Value> {
+            map.get(&serde_cbor::Value::Integer(key))
+        };
+        let get_text = |key: i128| -> Option<String> {
+            get_int(key).and_then(|v| match v {
+                serde_cbor::Value::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+        };
+        let get_u64 = |key: i128| -> Option<u64> {
+            get_int(key).and_then(|v| match v {
+                serde_cbor::Value::Integer(n) => Some(*n as u64),
+                _ => None,
+            })
+        };
+        let get_bool = |key: i128| -> Option<bool> {
+            get_int(key).and_then(|v| match v {
+                serde_cbor::Value::Bool(b) => Some(*b),
+                _ => None,
+            })
+        };
+
+        let image_type = get_text(-1)
+            .ok_or_else(|| anyhow!("BMO image-begin: missing required field -1 (image_type)"))?;
+
+        Ok(BmoImageBegin {
+            image_type,
+            total_size: get_u64(0),
+            hash_alg: get_text(1),
+            require_ack: get_bool(3).unwrap_or(false),
+            delivery_mode: get_u64(-6).unwrap_or(BMO_DELIVERY_MODE_INLINE),
+            name: get_text(-3),
+            version: get_text(-4),
+            description: get_text(-5),
+            boot_args: get_text(-2),
+            url: get_text(-7),
+        })
+    }
+
+    fn send_ack(si_out: &mut ServiceInfo, accepted: bool, code: Option<u64>, msg: Option<&str>) -> Result<()> {
+        let mut ack: Vec<serde_cbor::Value> = vec![serde_cbor::Value::Bool(accepted)];
+        if let Some(c) = code {
+            ack.push(serde_cbor::Value::Integer(c as i128));
+        }
+        if let Some(m) = msg {
+            ack.push(serde_cbor::Value::Text(m.to_string()));
+        }
+        si_out.add(FdoServiceInfoModule::Bmo, "image-ack", &ack)?;
+        Ok(())
+    }
+
+    fn send_result(si_out: &mut ServiceInfo, status: u64, msg: &str) -> Result<()> {
+        let result: Vec<serde_cbor::Value> = vec![
+            serde_cbor::Value::Integer(status as i128),
+            serde_cbor::Value::Text(msg.to_string()),
+        ];
+        si_out.add(FdoServiceInfoModule::Bmo, "image-result", &result)?;
+        Ok(())
+    }
+
+    fn finalize(&mut self, hash_bytes: Option<&[u8]>, hash_alg: &Option<String>, si_out: &mut ServiceInfo) -> Result<()> {
+        let begin = self.begin.take()
+            .ok_or_else(|| anyhow!("BMO image-end without image-begin"))?;
+
+        // Verify hash if provided
+        if let Some(expected_hash) = hash_bytes {
+            let alg = hash_alg.as_deref().unwrap_or("sha256");
+            let hash_type = match alg {
+                "sha256" => HashType::Sha256,
+                "sha384" => HashType::Sha384,
+                _ => {
+                    Self::send_result(si_out, 2, &format!("Unsupported hash algorithm: {}", alg))?;
+                    return Ok(());
+                }
+            };
+            let hash = Hash::from_digest(hash_type, expected_hash.to_vec())?;
+            if let Err(e) = hash.compare_data(&self.data) {
+                log::error!("BMO image hash mismatch: {:?}", e);
+                Self::send_result(si_out, 2, "Hash verification failed")?;
+                return Ok(());
+            }
+            log::info!("BMO image hash verified ({})", alg);
+        }
+
+        // Write image to output directory
+        fs::create_dir_all(&self.output_dir)
+            .context("BMO: failed to create output directory")?;
+
+        let filename = begin.name.as_deref().unwrap_or("bmo-image.bin");
+        let output_path = self.output_dir.join(filename);
+        fs::write(&output_path, &self.data)
+            .with_context(|| format!("BMO: failed to write image to {:?}", output_path))?;
+
+        log::info!(
+            "BMO image written: {:?} ({} bytes, type: {})",
+            output_path, self.data.len(), begin.image_type
+        );
+
+        if let Some(args) = &begin.boot_args {
+            let args_path = self.output_dir.join("boot_args");
+            fs::write(&args_path, args)
+                .with_context(|| format!("BMO: failed to write boot_args to {:?}", args_path))?;
+            log::info!("BMO boot args written: {:?}", args_path);
+        }
+
+        Self::send_result(si_out, 0, &format!("Image received: {} bytes", self.data.len()))?;
+        self.data.clear();
+        Ok(())
+    }
+}
+
+fn bmo_handle_set(value: &serde_cbor::Value, si_out: &mut ServiceInfo) -> Result<()> {
+    // value is a CBOR array of [name, value] pairs
+    let params = match value {
+        serde_cbor::Value::Array(a) => a,
+        _ => bail!("BMO set: expected CBOR array, got {:?}", value),
+    };
+
+    let output_dir = env::var("BMO_OUTPUT_DIR")
+        .unwrap_or_else(|_| "/tmp/fdo-bmo".to_string());
+    let params_path = PathBuf::from(&output_dir).join("bios_params");
+    fs::create_dir_all(&output_dir).context("BMO: failed to create output directory")?;
+
+    let mut param_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&params_path)
+        .with_context(|| format!("BMO: failed to open {:?}", params_path))?;
+
+    for param in params {
+        let pair = match param {
+            serde_cbor::Value::Array(p) if p.len() >= 2 => p,
+            _ => {
+                log::warn!("BMO set: skipping malformed parameter: {:?}", param);
+                continue;
+            }
+        };
+        let name = match &pair[0] {
+            serde_cbor::Value::Text(s) => s.clone(),
+            _ => {
+                log::warn!("BMO set: non-string parameter name: {:?}", pair[0]);
+                continue;
+            }
+        };
+        let value_str = match &pair[1] {
+            serde_cbor::Value::Text(s) => s.clone(),
+            serde_cbor::Value::Bool(b) => b.to_string(),
+            serde_cbor::Value::Integer(i) => i.to_string(),
+            serde_cbor::Value::Null => "null".to_string(),
+            other => format!("{:?}", other),
+        };
+
+        writeln!(param_file, "{}={}", name, value_str)
+            .with_context(|| format!("BMO: failed to write parameter {}={}", name, value_str))?;
+        log::info!("BMO BIOS parameter: {}={}", name, value_str);
+
+        let response: Vec<serde_cbor::Value> = vec![
+            serde_cbor::Value::Integer(0),
+            serde_cbor::Value::Text(format!("Set {}={}", name, value_str)),
+        ];
+        si_out.add(FdoServiceInfoModule::Bmo, "response", &response)?;
+    }
+
+    Ok(())
+}
+
+async fn process_serviceinfo_in(
+    si_in: &ServiceInfo,
+    si_out: &mut ServiceInfo,
+    bmo_in_progress: &mut BmoInProgress,
+    active_modules: &mut HashSet<ServiceInfoModule>,
+) -> Result<bool> {
     let mut sshkey_user: Option<String> = None;
     let mut sshkey_password: Option<String> = None;
     let mut sshkey_keys: Option<String> = None;
@@ -699,6 +921,51 @@ async fn process_serviceinfo_in(si_in: &ServiceInfo, si_out: &mut ServiceInfo) -
                     .context("Error executing clevis")?;
                 disk_encryption_in_progress = DiskEncryptionInProgress::new();
             }
+        } else if module == FdoServiceInfoModule::Bmo.into() {
+            if key == "image-begin" {
+                let begin = BmoInProgress::parse_image_begin(&value)
+                    .context("Error parsing BMO image-begin")?;
+                log::info!(
+                    "BMO image-begin: type={}, size={:?}, mode={}, name={:?}",
+                    begin.image_type, begin.total_size, begin.delivery_mode,
+                    begin.name
+                );
+                if begin.delivery_mode != BMO_DELIVERY_MODE_INLINE {
+                    BmoInProgress::send_ack(si_out, false, Some(14), Some("Only inline delivery supported"))?;
+                    log::warn!("BMO: rejecting non-inline delivery mode {}", begin.delivery_mode);
+                } else {
+                    if begin.require_ack {
+                        BmoInProgress::send_ack(si_out, true, None, None)?;
+                    }
+                    if let Some(size) = begin.total_size {
+                        bmo_in_progress.data.reserve(size as usize);
+                    }
+                    bmo_in_progress.begin = Some(begin);
+                }
+            } else if key.starts_with("image-data") {
+                let chunk = value.as_bytes()
+                    .context("Error parsing BMO image-data chunk")?;
+                bmo_in_progress.data.extend_from_slice(chunk);
+                log::trace!("BMO image-data: +{} bytes (total {})", chunk.len(), bmo_in_progress.data.len());
+            } else if key == "image-end" {
+                // Parse end map for hash
+                let hash_bytes = match &value {
+                    serde_cbor::Value::Map(m) => {
+                        m.get(&serde_cbor::Value::Integer(1)).and_then(|v| match v {
+                            serde_cbor::Value::Bytes(b) => Some(b.as_slice()),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                };
+                let hash_alg = bmo_in_progress.begin.as_ref().and_then(|b| b.hash_alg.clone());
+                bmo_in_progress.finalize(hash_bytes, &hash_alg, si_out)
+                    .context("Error finalizing BMO image")?;
+                *bmo_in_progress = BmoInProgress::new();
+            } else if key == "set" {
+                bmo_handle_set(&value, si_out)
+                    .context("Error handling BMO set")?;
+            }
         }
     }
 
@@ -761,6 +1028,8 @@ pub(crate) async fn perform_to2_serviceinfos(client: &mut ServiceClient) -> Resu
     let mut loop_num = 0;
     let mut out_si = ServiceInfo::new();
     let mut reboot_required = false;
+    let mut bmo_state = BmoInProgress::new();
+    let mut active_modules: HashSet<ServiceInfoModule> = HashSet::new();
 
     while loop_num < MAX_SERVICE_INFO_LOOPS {
         if loop_num == 0 {
@@ -795,11 +1064,11 @@ pub(crate) async fn perform_to2_serviceinfos(client: &mut ServiceClient) -> Resu
             out_si.add_modules(&modules)?;
         }
 
-        let send_si = DeviceServiceInfo::new(false, out_si);
+        let send_si = DeviceSvcInfo20::new(false, out_si);
         out_si = ServiceInfo::new();
         log::trace!("Sending ServiceInfo loop {}: {:?}", loop_num, send_si);
 
-        let return_si: RequestResult<OwnerServiceInfo> = client.send_request(send_si, None).await;
+        let return_si: RequestResult<OwnerSvcInfo20> = client.send_request(send_si, None).await;
         let return_si =
             return_si.with_context(|| format!("Error during ServiceInfo loop {loop_num}"))?;
         log::trace!("Got ServiceInfo loop {}: {:?}", loop_num, return_si);
@@ -808,15 +1077,17 @@ pub(crate) async fn perform_to2_serviceinfos(client: &mut ServiceClient) -> Resu
             log::trace!("ServiceInfo loops done, number taken: {}", loop_num);
             return Ok(reboot_required);
         }
-        if return_si.is_more_service_info() {
-            // TODO
-            bail!("OwnerServiceInfo indicated it has more for us.. we don't support that yet");
-        }
 
-        // Process
-        let reboot_si = process_serviceinfo_in(return_si.service_info(), &mut out_si)
+        // Process current batch of serviceinfo
+        let reboot_si = process_serviceinfo_in(
+            return_si.service_info(), &mut out_si, &mut bmo_state, &mut active_modules,
+        )
             .await
             .context("Error processing returned serviceinfo")?;
+
+        if return_si.is_more_service_info() {
+            log::trace!("Owner has more ServiceInfo, continuing loop {}", loop_num);
+        }
         if !reboot_required {
             reboot_required = reboot_si;
         }

@@ -1,3 +1,7 @@
+// Copyright (c) 2021, Red Hat, Inc.
+// Copyright (c) 2026, Dell Technologies, Inc.
+// SPDX-License-Identifier: BSD-3-Clause
+
 use std::convert::TryFrom;
 use std::str::FromStr;
 
@@ -11,8 +15,8 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 mod serviceinfo_names;
 
 pub use serviceinfo_names::{
-    FedoraIotServiceInfoModule, RedHatComServiceInfoModule, ServiceInfoModule,
-    StandardServiceInfoModule,
+    FdoServiceInfoModule, FedoraIotServiceInfoModule, RedHatComServiceInfoModule,
+    ServiceInfoModule, StandardServiceInfoModule,
 };
 
 #[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr, PartialEq, Eq, PartialOrd)]
@@ -21,6 +25,7 @@ pub use serviceinfo_names::{
 pub enum ProtocolVersion {
     Version1_0 = 100,
     Version1_1 = 101,
+    Version2_0 = 200,
 }
 
 impl std::fmt::Display for ProtocolVersion {
@@ -147,14 +152,20 @@ pub enum PublicKeyEncoding {
 #[non_exhaustive]
 pub enum HeaderKeys {
     EatNonce = 10,
-    EatUeid = 11,
 
     CUPHNonce = 256,
     CUPHOwnerPubKey = 257,
+    CUPHDelegateChain = 258,
     EUPHNonce = -259,
 
     EatFDO = -257,
 }
+
+// EAT UEID claim key = 256 per the EAT specification.
+// This is the same numeric value as CUPHNonce, but they live in different
+// CBOR maps (EAT payload vs COSE unprotected header), so there's no conflict
+// at the wire level. We use a raw constant instead of an enum variant.
+pub const EAT_UEID_CLAIM_KEY: i64 = 256;
 
 impl HeaderKeys {
     pub(crate) fn cbor_value(&self) -> serde_cbor::Value {
@@ -368,7 +379,7 @@ pub enum MessageType {
     TO1HelloRVAck = 31,
     TO1ProveToRV = 32,
     TO1RVRedirect = 33,
-    // Transfer Ownership protocol 2 (TO2)
+    // Transfer Ownership protocol 2 (TO2) - FDO 1.1
     TO2HelloDevice = 60,
     TO2ProveOVHdr = 61,
     TO2GetOVNextEntry = 62,
@@ -381,6 +392,20 @@ pub enum MessageType {
     TO2OwnerServiceInfo = 69,
     TO2Done = 70,
     TO2Done2 = 71,
+
+    // Transfer Ownership protocol 2 (TO2) - FDO 2.0
+    TO2HelloDeviceProbe = 80,
+    TO2HelloDeviceAck20 = 81,
+    TO2ProveDevice20 = 82,
+    TO2ProveOVHdr20 = 83,
+    TO2GetOVNextEntry20 = 84,
+    TO2OVNextEntry20 = 85,
+    TO2DeviceSvcInfoRdy20 = 86,
+    TO2SetupDevice20 = 87,
+    TO2DeviceSvcInfo20 = 88,
+    TO2OwnerSvcInfo20 = 89,
+    TO2Done20 = 90,
+    TO2DoneAck20 = 91,
 
     // Custom: DIUN
     DIUNConnect = 210,

@@ -39,6 +39,7 @@ pub enum ServiceInfoModule {
     Standard(StandardServiceInfoModule),
     FedoraIot(FedoraIotServiceInfoModule),
     RedHatCom(RedHatComServiceInfoModule),
+    Fdo(FdoServiceInfoModule),
     Unsupported(String),
 }
 
@@ -58,6 +59,8 @@ impl FromStr for ServiceInfoModule {
             "com.redhat.subscriptionmanager" => {
                 RedHatComServiceInfoModule::SubscriptionManager.into()
             }
+
+            "fdo.bmo" => FdoServiceInfoModule::Bmo.into(),
 
             "devmod" => StandardServiceInfoModule::DevMod.into(),
 
@@ -84,6 +87,12 @@ impl From<RedHatComServiceInfoModule> for ServiceInfoModule {
     }
 }
 
+impl From<FdoServiceInfoModule> for ServiceInfoModule {
+    fn from(module: FdoServiceInfoModule) -> Self {
+        ServiceInfoModule::Fdo(module)
+    }
+}
+
 impl Display for ServiceInfoModule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -94,6 +103,10 @@ impl Display for ServiceInfoModule {
             }
             ServiceInfoModule::RedHatCom(module) => {
                 write!(f, "com.redhat.")?;
+                Display::fmt(module, f)
+            }
+            ServiceInfoModule::Fdo(module) => {
+                write!(f, "fdo.")?;
                 Display::fmt(module, f)
             }
             ServiceInfoModule::Unsupported(other) => write!(f, "{other}"),
@@ -158,6 +171,24 @@ impl Display for RedHatComServiceInfoModule {
             "{}",
             match self {
                 RedHatComServiceInfoModule::SubscriptionManager => "subscriptionmanager",
+            }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FdoServiceInfoModule {
+    Bmo,
+}
+
+impl Display for FdoServiceInfoModule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                FdoServiceInfoModule::Bmo => "bmo",
             }
         )
     }

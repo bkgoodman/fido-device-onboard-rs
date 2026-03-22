@@ -1,3 +1,7 @@
+// Copyright (c) 2021, Red Hat, Inc.
+// Copyright (c) 2026, Dell Technologies, Inc.
+// SPDX-License-Identifier: BSD-3-Clause
+
 use thiserror::Error;
 
 use crate::{
@@ -6,6 +10,7 @@ use crate::{
 };
 
 pub mod v11;
+pub mod v20;  // FDO 2.0 messages
 
 pub trait ClientMessage: Message {}
 pub trait ServerMessage: Message {}
@@ -51,6 +56,12 @@ pub trait Message: Send + Serializable + Sized {
                         0,
                     ),
                     ProtocolVersion::Version1_1 => v11::ErrorMessage::new(
+                        ErrorCode::InternalServerError,
+                        Self::message_type(),
+                        "Error serializing response".to_string(),
+                        0,
+                    ),
+                    ProtocolVersion::Version2_0 => v11::ErrorMessage::new(
                         ErrorCode::InternalServerError,
                         Self::message_type(),
                         "Error serializing response".to_string(),

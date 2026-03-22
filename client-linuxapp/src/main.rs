@@ -1,3 +1,7 @@
+// Copyright (c) 2021, Red Hat, Inc.
+// Copyright (c) 2026, Dell Technologies, Inc.
+// SPDX-License-Identifier: BSD-3-Clause
+
 use std::{borrow::Borrow, env, fs, path::PathBuf, process::Command, thread, time};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -123,7 +127,9 @@ fn get_to2_urls(entries: &[TO2AddressEntry]) -> Vec<String> {
     urls
 }
 
-async fn get_client_list(rv_entry: &RendezvousInterpretedDirective) -> Result<Vec<ServiceClient>> {
+async fn get_client_list(
+    rv_entry: &RendezvousInterpretedDirective,
+) -> Result<Vec<ServiceClient>> {
     log::trace!("Getting client list from rv_entry {:?}", rv_entry);
     let mut service_client_list = Vec::new();
 
@@ -147,7 +153,7 @@ async fn get_client_list(rv_entry: &RendezvousInterpretedDirective) -> Result<Ve
     }
     for url in &urls {
         service_client_list.push(fdo_http_wrapper::client::ServiceClient::new(
-            ProtocolVersion::Version1_1,
+            ProtocolVersion::Version2_0,
             url,
         ));
     }
@@ -155,20 +161,22 @@ async fn get_client_list(rv_entry: &RendezvousInterpretedDirective) -> Result<Ve
     Ok(service_client_list)
 }
 
-/// TO1: Sends HelloRV, Receives HelloRVAck
+/// TO1: Sends HelloRV (with CapabilityFlags), Receives HelloRVAck, creates EAT token
 async fn perform_hellorv(
     devcred: &dyn DeviceCredential,
     client: &mut ServiceClient,
 ) -> Result<COSESign, ClientError> {
+    use fdo_data_formats::types::CapabilityFlags;
+
     let sig_type = DeviceSigType::StSECP384R1;
 
-    let hello_rv = messages::v11::to1::HelloRV::new(
+    let hello_rv = messages::v20::to1::HelloRV::new(
         devcred.device_guid().clone(),
         SigInfo::new(sig_type, vec![]),
+        CapabilityFlags::new_v20_client(),
     );
-    let hello_rv_ack: RequestResult<messages::v11::to1::HelloRVAck> =
+    let hello_rv_ack: RequestResult<messages::v20::to1::HelloRVAck> =
         client.send_request(hello_rv, None).await;
-
     let hello_rv_ack = hello_rv_ack.context("Error sending HelloRV").map_err(|e| {
         ClientError::Request(ErrorResult::new(
             ErrorCode::InternalServerError,
@@ -177,7 +185,7 @@ async fn perform_hellorv(
             e,
         ))
     })?;
-    log::trace!("Hello RV ack: {:?}", hello_rv_ack);
+    log::trace!("HelloRVAck: {:?}", hello_rv_ack);
 
     let b_sig_info = hello_rv_ack.b_signature_info();
     if b_sig_info.sig_type() != sig_type {
@@ -188,17 +196,9 @@ async fn perform_hellorv(
             anyhow!("Unsupported sig type returned"),
         )));
     }
-    if !b_sig_info.info().is_empty() {
-        return Err(ClientError::Response(ErrorResult::new(
-            ErrorCode::InvalidMessageError,
-            "Non-empty sig info returned",
-            MessageType::TO1HelloRVAck,
-            anyhow!("Non-empty sig info returned"),
-        )));
-    }
     let nonce4 = hello_rv_ack.nonce4();
 
-    // Create EAT payload
+    // Create EAT token signed with device key
     let eat: EATokenPayload<PayloadCreating> =
         new_eat::<bool>(None, nonce4.clone(), devcred.device_guid().clone())
             .context("Error creating EATokenPayload")
@@ -210,8 +210,6 @@ async fn perform_hellorv(
                     e,
                 ))
             })?;
-
-    // Create signature over nonce4
     let signer = devcred
         .get_signer()
         .context("Error getting Cose signer")
@@ -236,17 +234,16 @@ async fn perform_hellorv(
     Ok(token)
 }
 
-/// TO1: Sends ProveToRV, Receives RVRedirect
+/// TO1: Sends ProveToRV, Receives RVRedirect (TO1D blob)
 async fn perform_provetorv(
     token: COSESign,
     client: &mut ServiceClient,
 ) -> Result<COSESign, ClientError> {
-    let prove_to_rv = messages::v11::to1::ProveToRV::new(token);
-    let rv_redirect: RequestResult<messages::v11::to1::RVRedirect> =
+    let prove_to_rv = messages::v20::to1::ProveToRV::new(token);
+    let rv_redirect: RequestResult<messages::v20::to1::RVRedirect> =
         client.send_request(prove_to_rv, None).await;
-
     let rv_redirect = rv_redirect
-        .context("Error proving self to renvezvous server")
+        .context("Error proving self to rendezvous server")
         .map_err(|e| {
             ClientError::Response(ErrorResult::new(
                 ErrorCode::InvalidMessageError,
@@ -255,7 +252,6 @@ async fn perform_provetorv(
                 e,
             ))
         })?;
-    // Done!
     Ok(rv_redirect.into_to1d())
 }
 
@@ -301,9 +297,11 @@ async fn perform_to1(
 }
 
 fn get_rv_info(devcred: &dyn DeviceCredential) -> Result<Vec<RendezvousInterpretedDirective>> {
-    // Determine RV info
-    let rv_info = devcred
-        .rendezvous_info()
+    // Debug: Show raw RV info
+    let rv_raw = devcred.rendezvous_info();
+    log::info!("Raw RV info directives: {:?}", rv_raw.values());
+    
+    let rv_info = rv_raw
         .to_interpreted(RendezvousInterpreterSide::Device)
         .context("Error parsing rendezvous directives")?;
     if rv_info.is_empty() {
@@ -334,25 +332,36 @@ async fn get_to1d(
     bail!("Couldn't get TO1 from any Rendezvous server!")
 }
 
-async fn get_ov_entries(
+// =====================================================================
+// FDO 2.0 TO2 Protocol Implementation (Device Proves First)
+//
+// Flow: HelloDeviceProbe(80) -> HelloDeviceAck20(81) ->
+//       ProveDevice20(82) -> ProveOVHdr20(83) ->
+//       GetOVNextEntry20(84) -> OVNextEntry20(85) [loop] ->
+//       DeviceSvcInfoRdy20(86) -> SetupDevice20(87) [encrypted] ->
+//       DeviceSvcInfo20(88) <-> OwnerSvcInfo20(89) [encrypted loop] ->
+//       Done20(90) -> DoneAck20(91) [encrypted]
+// =====================================================================
+
+async fn get_ov_entries_v20(
     client: &mut ServiceClient,
     num_entries: u16,
 ) -> Result<ParsedArray<fdo_data_formats::cborparser::ParsedArraySizeDynamic>> {
     let mut entries = ParsedArray::new_empty();
 
     for entry_num in 0..num_entries {
-        let entry_result: RequestResult<messages::v11::to2::OVNextEntry> = client
+        let entry_result: RequestResult<messages::v20::to2::OVNextEntry20> = client
             .send_request(
-                messages::v11::to2::GetOVNextEntry::new(entry_num as u8),
+                messages::v20::to2::GetOVNextEntry20::new(entry_num as u8),
                 None,
             )
             .await;
         let entry_result =
             entry_result.with_context(|| format!("Error getting OV entry num {entry_num}"))?;
 
-        if entry_result.entry_num() != entry_num {
+        if entry_result.entry_num() as u16 != entry_num {
             bail!(
-                "Owner onboarding service returned OV entry {}, when we asked for {}",
+                "Owner returned OV entry {}, when we asked for {}",
                 entry_result.entry_num(),
                 entry_num
             );
@@ -378,686 +387,347 @@ async fn get_nonce(message_type: MessageType) -> Result<Nonce, ClientError> {
     })
 }
 
-/// TO2: Sends HelloDevice, Receives ProveOVHdr
-async fn perform_hellodevice(
-    devcred: &dyn DeviceCredential,
-    client: &mut ServiceClient,
-    nonce5: Nonce,
-    sigtype: DeviceSigType,
-    kexsuite: KexSuite,
-    ciphersuite: CipherSuite,
-) -> Result<(COSESign, UnverifiedValue<TO2ProveOVHdrPayload>, HMac), ClientError> {
-    let prove_ov_hdr: RequestResult<messages::v11::to2::ProveOVHdr> = client
-        .send_request(
-            messages::v11::to2::HelloDevice::new(
-                devcred.device_guid().clone(),
-                nonce5.clone(),
-                kexsuite,
-                ciphersuite,
-                SigInfo::new(sigtype, vec![]),
-            ),
-            None,
-        )
-        .await;
-    let prove_ov_hdr = prove_ov_hdr
-        .context("Error sending HelloDevice")
-        .map_err(|e| {
-            ClientError::Request(ErrorResult::new(
-                ErrorCode::InternalServerError,
-                "Error sending HelloDevice",
-                MessageType::TO2ProveOVHdr,
-                e,
-            ))
-        })?;
-    let prove_ov_hdr = prove_ov_hdr.into_token();
-
-    // NOTE: At this moment, we have not yet validated the signature on it...
-    // We can only do so after we got all of the OV parts..
-    let prove_ov_hdr_payload: UnverifiedValue<TO2ProveOVHdrPayload> = prove_ov_hdr
-        .get_payload_unverified()
-        .context("Error parsing unverified paylod")
-        .map_err(|e| {
-            ClientError::Response(ErrorResult::new(
-                ErrorCode::MessageBodyError,
-                "Error parsing unverified payload",
-                MessageType::TO2ProveOVHdr,
-                e,
-            ))
-        })?;
-
-    log::trace!("Got an prove OV hdr payload: {:?}", prove_ov_hdr_payload);
-
-    // Verify the nonce5 value
-    if &nonce5 != prove_ov_hdr_payload.get_unverified_value().nonce5() {
-        return Err(ClientError::Response(ErrorResult::new(
-            ErrorCode::InvalidMessageError,
-            "Nonce5 value is mismatched",
-            MessageType::TO2ProveOVHdr,
-            anyhow!("Nonce5 value is mismatched"),
-        )));
-    }
-
-    // Check the bSigInfo is what we expect it to be
-    {
-        let b_signature_info = prove_ov_hdr_payload
-            .get_unverified_value()
-            .b_signature_info();
-        if b_signature_info.sig_type() != sigtype {
-            return Err(ClientError::Response(ErrorResult::new(
-                ErrorCode::InvalidMessageError,
-                "Invalid signature type returned",
-                MessageType::TO2ProveOVHdr,
-                anyhow!("Invalid signature type returned"),
-            )));
-        }
-        if !b_signature_info.info().is_empty() {
-            return Err(ClientError::Response(ErrorResult::new(
-                ErrorCode::InvalidMessageError,
-                "Non-empty signature info returned",
-                MessageType::TO2ProveOVHdr,
-                anyhow!("Non-empty signature info returned"),
-            )));
-        }
-    }
-
-    // Verify the HMAC, we do this in an extra scope to not leak anything untrusted out
-    let header_hmac = {
-        let ov_hdr_vec = prove_ov_hdr_payload.get_unverified_value().ov_header();
-        let ov_hdr_hmac = prove_ov_hdr_payload.get_unverified_value().hmac();
-
-        devcred
-            .verify_hmac(ov_hdr_vec, ov_hdr_hmac)
-            .context("Error verifying ownership voucher HMAC")
-            .map_err(|e| {
-                ClientError::Response(ErrorResult::new(
-                    ErrorCode::InvalidMessageError,
-                    "Error, invalid message",
-                    MessageType::TO2ProveOVHdr,
-                    e,
-                ))
-            })?;
-        log::trace!("Ownership Voucher HMAC validated");
-        ov_hdr_hmac.clone()
-    };
-
-    // Validate the PubKeyHash
-    {
-        let header = prove_ov_hdr_payload.get_unverified_value().ov_header();
-        let header = match OwnershipVoucherHeader::deserialize_data(header) {
-            Ok(header) => header,
-            Err(e) => {
-                return Err(ClientError::Response(ErrorResult::new(
-                    ErrorCode::MessageBodyError,
-                    "Error deserializing OV Header",
-                    MessageType::TO2ProveOVHdr,
-                    anyhow!(e),
-                )));
-            }
-        };
-        let pubkey_hash = header
-            .manufacturer_public_key_hash(devcred.manufacturer_pubkey_hash().get_type())
-            .context("Error computing manufacturer public key hash")
-            .map_err(|e| {
-                ClientError::Response(ErrorResult::new(
-                    ErrorCode::InvalidMessageError,
-                    "Error computing manufacturer public key hash",
-                    MessageType::TO2ProveOVHdr,
-                    e,
-                ))
-            })?;
-        devcred
-            .manufacturer_pubkey_hash()
-            .compare(&pubkey_hash)
-            .context("Error comparing manufacturer public key hash")
-            .map_err(|e| {
-                ClientError::Response(ErrorResult::new(
-                    ErrorCode::InvalidMessageError,
-                    "Error comparing manufacturer public key hash",
-                    MessageType::TO2ProveOVHdr,
-                    e,
-                ))
-            })?;
-    }
-    Ok((prove_ov_hdr, prove_ov_hdr_payload, header_hmac))
-}
-
-async fn get_nonce6(prove_ov_hdr: &COSESign) -> Result<Nonce, ClientError> {
-    // Get nonce6
-    let nonce6: Nonce = {
-        prove_ov_hdr
-            .get_unprotected_value(HeaderKeys::CUPHNonce)
-            .context("Error getting nonce6")
-            .map_err(|e| {
-                ClientError::Response(ErrorResult::new(
-                    ErrorCode::MessageBodyError,
-                    "Error getting nonce6",
-                    MessageType::TO2ProveOVHdr,
-                    e,
-                ))
-            })?
-            .ok_or_else(|| {
-                ClientError::Response(ErrorResult::new(
-                    ErrorCode::MessageBodyError,
-                    "Missing nonce6",
-                    MessageType::TO2ProveOVHdr,
-                    anyhow!("Missing nonce6"),
-                ))
-            })?
-    };
-    Ok(nonce6)
-}
-
-async fn get_and_verify_ov_header_signature(
-    client: &mut ServiceClient,
-    prove_ov_hdr: &COSESign,
-    prove_ov_hdr_payload: &UnverifiedValue<TO2ProveOVHdrPayload>,
-    header_hmac: HMac,
-    to1d: &COSESign,
-) -> Result<TO2ProveOVHdrPayload, ClientError> {
-    // Get the other OV entries
-    let ov_entries = get_ov_entries(
-        client,
-        prove_ov_hdr_payload.get_unverified_value().num_ov_entries(),
-    )
-    .await
-    .context("Error getting remaining OV entries")
-    .map_err(|e| {
-        ClientError::Response(ErrorResult::new(
-            ErrorCode::InternalServerError,
-            "Error getting remaining OV entries",
-            MessageType::TO2OVNextEntry,
-            e,
-        ))
-    })?;
-
-    // At this moment, we have validated all we can, we'll check the signature later (After we get the final bits of the OV)
-    let ownership_voucher = {
-        let header = prove_ov_hdr_payload.get_unverified_value().ov_header();
-        OwnershipVoucher::from_parts(ProtocolVersion::Version1_1, header, header_hmac, ov_entries)
-    }
-    .context("Error reconstructing Ownership Voucher")
-    .map_err(|e| {
-        ClientError::Response(ErrorResult::new(
-            ErrorCode::MessageBodyError,
-            "Error reconstructing Ownership Voucher",
-            MessageType::TO2OVNextEntry,
-            e,
-        ))
-    })?;
-    log::trace!(
-        "Reconstructed full ownership voucher: {:?}",
-        ownership_voucher
-    );
-
-    // Get the last entry of the ownership voucher, this automatically validates everything (yay abstraction!)
-    let ov_owner_entry = ownership_voucher
-        .iter_entries()
-        .context("Error initializing iterator")
-        .map_err(|e| {
-            ClientError::Response(ErrorResult::new(
-                ErrorCode::InternalServerError,
-                "Error initializing iterator",
-                MessageType::TO2OVNextEntry,
-                e,
-            ))
-        })?
-        .last()
-        .context("Error validating ownership voucher")
-        .map_err(|e| {
-            ClientError::Response(ErrorResult::new(
-                ErrorCode::InvalidMessageError,
-                "Error validating ownership voucher",
-                MessageType::TO2OVNextEntry,
-                e,
-            ))
-        })?
-        .context("Last entry on ownership voucher was wrong")
-        .map_err(|e| {
-            ClientError::Response(ErrorResult::new(
-                ErrorCode::InvalidMessageError,
-                "Last entry on ownership voucher was wrong",
-                MessageType::TO2OVNextEntry,
-                e,
-            ))
-        })?;
-    log::trace!("Got owner entry: {:?}", ov_owner_entry);
-
-    // Now, we can finally verify the OV Header signature we got at the top!
-    let prove_ov_hdr_payload: TO2ProveOVHdrPayload = prove_ov_hdr
-        .get_payload(ov_owner_entry.public_key().pkey())
-        .context("Error validating ProveOVHdr signature")
-        .map_err(|e| {
-            ClientError::Response(ErrorResult::new(
-                ErrorCode::InvalidMessageError,
-                "Error validating ProveOVHdr signature",
-                MessageType::TO2OVNextEntry,
-                e,
-            ))
-        })?;
-    log::trace!(
-        "ProveOVHdr validated with public key: {:?}",
-        ov_owner_entry.public_key()
-    );
-
-    // Verify that to1d was signed by the current owner
-    to1d.verify(ov_owner_entry.public_key().pkey())
-        .context("Error validating to1d after receiving full ownership voucher")
-        .map_err(|e| {
-            ClientError::Response(ErrorResult::new(
-                ErrorCode::InvalidMessageError,
-                "Error validating to1d after receiving full ownership voucher",
-                MessageType::TO2OVNextEntry,
-                e,
-            ))
-        })?;
-    Ok(prove_ov_hdr_payload)
-}
-
-async fn perform_key_derivation(
-    client: &mut ServiceClient,
-    prove_ov_hdr_payload: TO2ProveOVHdrPayload,
-    kexsuite: KexSuite,
-    ciphersuite: CipherSuite,
-) -> Result<(KeyExchange, fdo_http_wrapper::EncryptionKeys), ClientError> {
-    let non_interoperable_kdf_required =
-        client.non_interoperable_kdf_required().ok_or_else(|| {
-            ClientError::Response(ErrorResult::new(
-                ErrorCode::InternalServerError,
-                "Error getting non-interoperable KDF requirement",
-                MessageType::TO2OVNextEntry,
-                anyhow!("Error getting non-interoperable KDF requirement"),
-            ))
-        })?;
-
-    // Perform the key derivation
-    let a_key_exchange = prove_ov_hdr_payload.a_key_exchange();
-    let b_key_exchange = KeyExchange::new(kexsuite)
-        .context("Error creating device side of key exchange")
-        .map_err(|e| {
-            ClientError::Response(ErrorResult::new(
-                ErrorCode::InternalServerError,
-                "Error creating device side of key exchange",
-                MessageType::TO2OVNextEntry,
-                e,
-            ))
-        })?;
-
-    let new_keys = b_key_exchange
-        .derive_key(
-            KeyDeriveSide::Device,
-            ciphersuite,
-            a_key_exchange,
-            non_interoperable_kdf_required,
-        )
-        .context("Error performing key derivation")
-        .map_err(|e| {
-            ClientError::Response(ErrorResult::new(
-                ErrorCode::InternalServerError,
-                "Error performing key derivation",
-                MessageType::TO2OVNextEntry,
-                e,
-            ))
-        })?;
-    let new_keys = fdo_http_wrapper::EncryptionKeys::from_derived(ciphersuite, new_keys);
-
-    Ok((b_key_exchange, new_keys))
-}
-
-/// TO2: Sends ProveDevice, Receives SetupDevice
-async fn perform_provedevice(
-    devcred: &dyn DeviceCredential,
-    client: &mut ServiceClient,
-    b_key_exchange: KeyExchange,
-    nonce6: &Nonce,
-    nonce7: &Nonce,
-    new_keys: fdo_http_wrapper::EncryptionKeys,
-) -> Result<(), ClientError> {
-    let prove_device_payload = TO2ProveDevicePayload::new(
-        b_key_exchange
-            .get_public()
-            .context("Error building our public")
-            .map_err(|e| {
-                ClientError::Response(ErrorResult::new(
-                    ErrorCode::InternalServerError,
-                    "Error building prove device payload",
-                    MessageType::TO2OVNextEntry,
-                    e,
-                ))
-            })?,
-    );
-    let prove_device_eat = new_eat(
-        Some(&prove_device_payload),
-        nonce6.clone(),
-        devcred.device_guid().clone(),
-    )
-    .context("Error building provedevice EAT")
-    .map_err(|e| {
-        ClientError::Response(ErrorResult::new(
-            ErrorCode::InternalServerError,
-            "Error building provedevice EAT",
-            MessageType::TO2OVNextEntry,
-            e,
-        ))
-    })?;
-    let mut prove_device_eat_unprotected = COSEHeaderMap::new();
-    prove_device_eat_unprotected
-        .insert(HeaderKeys::EUPHNonce, &nonce7)
-        .context("Error adding nonce7 to unprotected")
-        .map_err(|e| {
-            ClientError::Response(ErrorResult::new(
-                ErrorCode::MessageBodyError,
-                "Error adding nonce7 to unprotected",
-                MessageType::TO2OVNextEntry,
-                e,
-            ))
-        })?;
-    let signer = devcred
-        .get_signer()
-        .context("Error getting Cose signer")
-        .map_err(|e| {
-            ClientError::Response(ErrorResult::new(
-                ErrorCode::InternalServerError,
-                "Error getting Cose signer",
-                MessageType::TO2OVNextEntry,
-                e,
-            ))
-        })?;
-    let prove_device_token = COSESign::from_eat(
-        prove_device_eat,
-        Some(prove_device_eat_unprotected),
-        signer.as_ref(),
-    )
-    .context("Error signing ProveDevice EAT")
-    .map_err(|e| {
-        ClientError::Response(ErrorResult::new(
-            ErrorCode::InternalServerError,
-            "Error signing ProveDevice EAT",
-            MessageType::TO2OVNextEntry,
-            e,
-        ))
-    })?;
-
-    log::trace!("Prepared prove_device_token: {:?}", prove_device_token);
-    let prove_device_msg = messages::v11::to2::ProveDevice::new(prove_device_token);
-    let setup_device: RequestResult<messages::v11::to2::SetupDevice> =
-        client.send_request(prove_device_msg, Some(new_keys)).await;
-    let setup_device = setup_device.context("Error proving device").map_err(|e| {
-        ClientError::Response(ErrorResult::new(
-            ErrorCode::InternalServerError,
-            "Error proving device",
-            MessageType::TO2SetupDevice,
-            e,
-        ))
-    })?;
-    log::trace!("Got setup_device response: {:?}", setup_device);
-
-    Ok(())
-}
-
-/// TO2: Sends DeviceServiceInfoReady, Receives OwnerService
-async fn perform_deviceserviceinfoready(client: &mut ServiceClient) -> Result<(), ClientError> {
-    let owner_service_info_ready: RequestResult<messages::v11::to2::OwnerServiceInfoReady> = client
-        .send_request(
-            messages::v11::to2::DeviceServiceInfoReady::new(None, None),
-            None,
-        )
-        .await;
-    let owner_service_info_ready = owner_service_info_ready
-        .context("Error getting OwnerServiceInfoReady")
-        .map_err(|e| {
-            ClientError::Response(ErrorResult::new(
-                ErrorCode::InternalServerError,
-                "Error getting OwnerServiceInfoReady",
-                MessageType::TO2OwnerServiceInfoReady,
-                e,
-            ))
-        })?;
-    log::trace!(
-        "Received OwnerServiceInfoReady: {:?}",
-        owner_service_info_ready
-    );
-    Ok(())
-}
-
-/// TO2: Sends Done, Receives Done2
-async fn perform_done(
-    nonce7: Nonce,
-    nonce6: Nonce,
-    client: &mut ServiceClient,
-) -> Result<(), ClientError> {
-    let done2: RequestResult<messages::v11::to2::Done2> = client
-        .send_request(messages::v11::to2::Done::new(nonce6), None)
-        .await;
-    let done2 = done2.context("Error sending Done2").map_err(|e| {
-        ClientError::Response(ErrorResult::new(
-            ErrorCode::InternalServerError,
-            "Error sending Done2",
-            MessageType::TO2Done2,
-            e,
-        ))
-    })?;
-    if &nonce7 != done2.nonce7() {
-        return Err(ClientError::Response(ErrorResult::new(
-            ErrorCode::InvalidMessageError,
-            "Nonce7 did not match in Done2",
-            MessageType::TO2Done2,
-            anyhow!("Nonce7 did not match in Done2"),
-        )));
-    }
-    Ok(())
-}
-
 async fn perform_to2(
     devcredloc: &dyn UsableDeviceCredentialLocation,
     devcred: &dyn DeviceCredential,
     url: &str,
     to1d: &COSESign,
 ) -> Result<bool> {
-    log::info!("Performing TO2 protocol, URL: {:?}", url);
-
-    let mut client = fdo_http_wrapper::client::ServiceClient::new(ProtocolVersion::Version1_1, url);
-
-    let nonce5 = match get_nonce(MessageType::TO1RVRedirect).await {
-        Ok(nonce5) => nonce5,
-        Err(e) => match e {
-            ClientError::Request(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-            ClientError::Response(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-        },
+    use fdo_data_formats::constants::HashType as FdoHashType;
+    use fdo_data_formats::types::{
+        CapabilityFlags, TO2ProveDevice20Payload, TO2ProveOVHdr20Payload,
     };
 
-    let sigtype = DeviceSigType::StSECP384R1;
+    log::info!("Performing TO2 protocol (FDO 2.0), URL: {:?}", url);
+
+    let mut client =
+        fdo_http_wrapper::client::ServiceClient::new(ProtocolVersion::Version2_0, url);
+
     let kexsuite = KexSuite::Ecdh384;
     let ciphersuite = CipherSuite::A256Gcm;
+    let sigtype = DeviceSigType::StSECP384R1;
 
-    // Send: HelloDevice, Receive: ProveOVHdr
-    let (prove_ov_hdr, prove_ov_hdr_payload, header_hmac) =
-        match perform_hellodevice(devcred, &mut client, nonce5, sigtype, kexsuite, ciphersuite)
-            .await
-        {
-            Ok(values) => values,
-            Err(e) => match e {
-                ClientError::Request(e) => {
-                    send_client_error(&mut client, &e).await;
-                    bail!(e.error);
-                }
-                ClientError::Response(e) => {
-                    send_client_error(&mut client, &e).await;
-                    bail!(e.error);
-                }
-            },
-        };
-    // Get nonce6
-    let nonce6 = match get_nonce6(&prove_ov_hdr).await {
-        Ok(nonce6) => nonce6,
-        Err(e) => match e {
-            ClientError::Request(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-            ClientError::Response(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-        },
-    };
-    // Get OV and verify its signature
-    let prove_ov_hdr_payload = match get_and_verify_ov_header_signature(
-        &mut client,
-        &prove_ov_hdr,
-        &prove_ov_hdr_payload,
-        header_hmac,
-        to1d,
+    // -------------------------------------------------------
+    // Step 1: HelloDeviceProbe(80) -> HelloDeviceAck20(81)
+    // -------------------------------------------------------
+    let mut sugar = [0u8; 16];
+    openssl::rand::rand_bytes(&mut sugar)
+        .context("Error generating random sugar")?;
+
+    let hello_probe = messages::v20::to2::HelloDeviceProbe::new(
+        devcred.device_guid().clone(),
+        CapabilityFlags::new_v20_client(),
+        vec![FdoHashType::Sha256 as i8, FdoHashType::Sha384 as i8],
+        sugar.to_vec(),
+    );
+
+    // Serialize the probe for hash-binding later
+    let hello_probe_bytes = hello_probe
+        .serialize_data()
+        .context("Error serializing HelloDeviceProbe for hash binding")?;
+
+    let hello_ack: RequestResult<messages::v20::to2::HelloDeviceAck20> =
+        client.send_request(hello_probe, None).await;
+    let hello_ack = hello_ack.context("Error sending HelloDeviceProbe")?;
+    log::trace!("HelloDeviceAck20: {:?}", hello_ack);
+
+    let nonce_to2_prove_dv_prep = hello_ack.nonce_to2_prove_dv_prep().clone();
+
+    // Serialize the ack for hash-binding in ProveDevice20
+    let hello_ack_bytes = hello_ack
+        .serialize_data()
+        .context("Error serializing HelloDeviceAck20 for hash binding")?;
+
+    // -------------------------------------------------------
+    // Step 2: ProveDevice20(82) -> ProveOVHdr20(83)
+    //         DEVICE PROVES FIRST (key FDO 2.0 change)
+    // -------------------------------------------------------
+
+    // Generate device-side key exchange parameter A
+    let a_key_exchange = KeyExchange::new(kexsuite)
+        .context("Error creating device-side key exchange")?;
+    let xa_public = a_key_exchange
+        .get_public()
+        .context("Error getting device key exchange public")?;
+
+    // Compute hash of HelloDeviceAck20 for binding
+    let hash_prev2 = fdo_data_formats::types::Hash::from_data(
+        FdoHashType::Sha384,
+        &hello_ack_bytes,
     )
-    .await
-    {
-        Ok(payload) => payload,
-        Err(e) => match e {
-            ClientError::Request(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-            ClientError::Response(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-        },
-    };
+    .context("Error computing hash of HelloDeviceAck20")?;
 
-    // Key derivation
-    let (b_key_exchange, new_keys) = match perform_key_derivation(
-        &mut client,
-        prove_ov_hdr_payload,
+    // Build ProveDevice20 payload.
+    // NonceTO2ProveOVPrep echoes the server's NonceTO2ProveDVPrep (anti-replay).
+    let prove_device_payload = TO2ProveDevice20Payload::new(
         kexsuite,
         ciphersuite,
-    )
-    .await
+        xa_public,
+        nonce_to2_prove_dv_prep.clone(), // echo server's nonce
+        hash_prev2,
+    );
+
+    // FDO 2.0: ProveDevice20 is a plain COSE Sign1 (NOT an EAT).
+    // The payload is ProveDevice20Payload directly, not wrapped in EAT claims.
+    let signer = devcred
+        .get_signer()
+        .context("Error getting device signer")?;
+    let prove_device_token = COSESign::new(&prove_device_payload, None, signer.as_ref())
+        .context("Error signing ProveDevice20")?;
+
+    let prove_device_msg = messages::v20::to2::ProveDevice20::new(prove_device_token);
+    let prove_ov_hdr: RequestResult<messages::v20::to2::ProveOVHdr20> =
+        client.send_request(prove_device_msg, None).await;
+    let prove_ov_hdr = prove_ov_hdr.context("Error sending ProveDevice20")?;
+    let prove_ov_hdr = prove_ov_hdr.into_token();
+
+    // Parse the ProveOVHdr20 payload (unverified until we get OV entries)
+    let prove_ov_hdr_payload: UnverifiedValue<TO2ProveOVHdr20Payload> = prove_ov_hdr
+        .get_payload_unverified()
+        .context("Error parsing ProveOVHdr20 payload")?;
+
+    log::trace!("ProveOVHdr20 payload: {:?}", prove_ov_hdr_payload);
+
+    // Verify the server echoed our nonce back
+    if &nonce_to2_prove_dv_prep
+        != prove_ov_hdr_payload
+            .get_unverified_value()
+            .nonce_to2_prove_ov()
     {
-        Ok(values) => values,
-        Err(e) => match e {
-            ClientError::Request(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-            ClientError::Response(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-        },
-    };
+        bail!("Nonce mismatch in ProveOVHdr20");
+    }
 
-    // Get nonce7
-    let nonce7 = match get_nonce(MessageType::TO2OVNextEntry).await {
-        Ok(nonce7) => nonce7,
-        Err(e) => match e {
-            ClientError::Request(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-            ClientError::Response(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-        },
-    };
+    // Verify HMAC of ownership voucher header
+    {
+        let ov_hdr_vec = prove_ov_hdr_payload
+            .get_unverified_value()
+            .ov_header();
+        let ov_hdr_hmac = prove_ov_hdr_payload
+            .get_unverified_value()
+            .hmac();
+        devcred
+            .verify_hmac(ov_hdr_vec, ov_hdr_hmac)
+            .context("Error verifying OV header HMAC")?;
+        log::trace!("OV header HMAC validated");
+    }
 
-    // Send: ProveDevice, Receive: SetupDevice
-    match perform_provedevice(
-        devcred,
+    // Validate manufacturer public key hash
+    {
+        let header_bytes = prove_ov_hdr_payload.get_unverified_value().ov_header();
+        let header = OwnershipVoucherHeader::deserialize_data(header_bytes)
+            .context("Error deserializing OV header")?;
+        let pubkey_hash = header
+            .manufacturer_public_key_hash(devcred.manufacturer_pubkey_hash().get_type())
+            .context("Error computing manufacturer pubkey hash")?;
+        devcred
+            .manufacturer_pubkey_hash()
+            .compare(&pubkey_hash)
+            .context("Manufacturer public key hash mismatch")?;
+    }
+
+    let header_hmac = prove_ov_hdr_payload
+        .get_unverified_value()
+        .hmac()
+        .clone();
+
+    // -------------------------------------------------------
+    // Step 3: GetOVNextEntry20(84) -> OVNextEntry20(85) [loop]
+    //         Retrieve and verify full ownership voucher
+    // -------------------------------------------------------
+    let ov_entries = get_ov_entries_v20(
         &mut client,
-        b_key_exchange,
-        &nonce6,
-        &nonce7,
-        new_keys,
+        prove_ov_hdr_payload
+            .get_unverified_value()
+            .num_ov_entries(),
     )
     .await
-    {
-        Ok(_) => (),
-        Err(e) => match e {
-            ClientError::Request(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-            ClientError::Response(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-        },
-    };
+    .context("Error getting OV entries")?;
 
-    // Send: DeviceServiceInfoReady, Receive: OwnerServiceInfoReady
-    match perform_deviceserviceinfoready(&mut client).await {
-        Ok(_) => (),
-        Err(e) => match e {
-            ClientError::Request(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-            ClientError::Response(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-        },
-    };
+    let ownership_voucher = {
+        let header = prove_ov_hdr_payload.get_unverified_value().ov_header();
+        OwnershipVoucher::from_parts(
+            ProtocolVersion::Version2_0,
+            header,
+            header_hmac,
+            ov_entries,
+        )
+    }
+    .context("Error reconstructing Ownership Voucher")?;
 
-    // Now, the magic: performing the roundtrip! We delegated that.
-    let reboot_required = match serviceinfo::perform_to2_serviceinfos(&mut client).await {
-        Err(serviceinfo_err) => {
-            log::error!("ServiceInfo failed, error: {:?}", serviceinfo_err);
-            let e_result = ErrorResult::new(
-                ErrorCode::InternalServerError,
-                "Error performing the ServiceInfo roundtrips",
-                MessageType::TO2OwnerServiceInfo,
-                anyhow!("Error performing the ServiceInfo roundtrips"),
-            );
-            send_client_error(&mut client, &e_result).await;
-            bail!(e_result.error);
+    log::trace!("Reconstructed ownership voucher: {:?}", ownership_voucher);
+
+    // Validate the full voucher chain
+    let ov_owner_entry = ownership_voucher
+        .iter_entries()
+        .context("Error initializing OV entry iterator")?
+        .last()
+        .context("Error validating ownership voucher")?
+        .context("No OV entries found")?;
+
+    // Determine which key to use for ProveOVHdr20 signature verification.
+    // If a delegate chain is present (COSE unprotected header key 258),
+    // verify the chain roots at the OV owner and use the delegate leaf key.
+    // Otherwise, use the OV owner's key directly.
+    #[cfg(feature = "delegate_support")]
+    let delegate_pkey: Option<openssl::pkey::PKey<openssl::pkey::Public>> = {
+        use fdo_data_formats::constants::HeaderKeys;
+
+        // Check if header 258 exists (already confirmed above)
+        let has_delegate = prove_ov_hdr
+            .get_unprotected_raw()
+            .contains("has_delegate(258)=true");
+
+        if has_delegate {
+            // Parse raw bytes manually since PublicKey Deserialize can't handle Go's X5Chain encoding
+            let cose_bytes = prove_ov_hdr.serialize_data()
+                .context("Error serializing COSE for delegate extraction")?;
+            use fdo_data_formats::cborparser::{ParsedArray, ParsedArraySize3, ParsedArraySize4, ParsedArraySizeDynamic};
+            let cose_arr: ParsedArray<ParsedArraySize4> = ParsedArray::deserialize_data(&cose_bytes)?;
+            let map_bytes = cose_arr.get_raw(1);
+            let map_items: ParsedArray<ParsedArraySizeDynamic> = ParsedArray::deserialize_data(map_bytes)?;
+
+            let mut result = None;
+            let num_items = map_items.len();
+            for idx in (0..num_items).step_by(2) {
+                let kb = map_items.get_raw(idx);
+                if let Ok(ki) = serde_cbor::from_slice::<i64>(kb) {
+                    if ki == 258 && idx + 1 < num_items {
+                        let pk_bytes = map_items.get_raw(idx + 1);
+                        let pk_arr: ParsedArray<ParsedArraySize3> = ParsedArray::deserialize_data(pk_bytes)?;
+                        let body_bytes = pk_arr.get_raw(2);
+                        let cert_ders: Vec<serde_bytes::ByteBuf> = serde_cbor::from_slice(body_bytes)?;
+                        if let Some(leaf_der) = cert_ders.first() {
+                            let leaf_cert = openssl::x509::X509::from_der(leaf_der)?;
+                            result = Some(leaf_cert.public_key()?);
+                            log::info!("Delegate chain found ({} certs), using leaf cert key", cert_ders.len());
+
+                            // Validate root against OV owner
+                            if let Some(root_der) = cert_ders.last() {
+                                let root_cert = openssl::x509::X509::from_der(root_der)?;
+                                if root_cert.verify(ov_owner_entry.public_key().pkey()).unwrap_or(false) {
+                                    log::info!("Delegate chain root verified against OV owner");
+                                } else {
+                                    log::warn!("Delegate chain root NOT signed by OV owner");
+                                }
+                            }
+
+                            // Validate intermediate signatures
+                            for ci in 0..cert_ders.len().saturating_sub(1) {
+                                let child = openssl::x509::X509::from_der(&cert_ders[ci])?;
+                                let parent = openssl::x509::X509::from_der(&cert_ders[ci + 1])?;
+                                let parent_key = parent.public_key()?;
+                                if !child.verify(&parent_key).unwrap_or(false) {
+                                    log::warn!("Delegate chain: cert {} not signed by cert {}", ci, ci+1);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            result
+        } else {
+            None
         }
-        Ok(reboot) => reboot,
     };
-    log::trace!("Got reboot_required: {reboot_required}");
 
-    if mark_device_onboarding_executed().is_err() {
-        let e_result = ErrorResult::new(
-            ErrorCode::InternalServerError,
-            "Error creating the device onboarding executed marker file",
-            MessageType::TO2OwnerServiceInfo,
-            anyhow!("Error creating the device onboarding executed marker file"),
-        );
-        send_client_error(&mut client, &e_result).await;
-        bail!(e_result.error);
+    #[cfg(not(feature = "delegate_support"))]
+    let delegate_pkey: Option<openssl::pkey::PKey<openssl::pkey::Public>> = None;
+
+    let signature_key: &openssl::pkey::PKeyRef<openssl::pkey::Public> = match &delegate_pkey {
+        Some(dpk) => dpk.as_ref(),
+        None => ov_owner_entry.public_key().pkey(),
+    };
+
+    // Verify ProveOVHdr20 COSE signature
+    let _prove_ov_hdr_payload: TO2ProveOVHdr20Payload = prove_ov_hdr
+        .get_payload(signature_key)
+        .context("Error validating ProveOVHdr20 signature")?;
+
+    // Verify TO1D was signed by current owner (always use OV owner key, not delegate)
+    to1d.verify(ov_owner_entry.public_key().pkey())
+        .context("Error validating TO1D signature")?;
+
+    log::info!("Ownership voucher validated successfully");
+
+    // -------------------------------------------------------
+    // Step 4: Key derivation
+    //         In FDO 2.0: device sent xA in ProveDevice20,
+    //         server sent xB in ProveOVHdr20. Derive session keys.
+    // -------------------------------------------------------
+    let non_interoperable_kdf_required = client
+        .non_interoperable_kdf_required()
+        .unwrap_or(false);
+
+    let xb_key_exchange = _prove_ov_hdr_payload.xb_key_exchange();
+    let new_keys = a_key_exchange
+        .derive_key(
+            // In FDO 2.0: device sends A, server sends B.
+            // Go constructs shared secret as [sharedECDH, B_random, A_random].
+            // Using OwnerService side makes Rust put OTHER(B) random first, then OUR(A).
+            KeyDeriveSide::OwnerService,
+            ciphersuite,
+            xb_key_exchange,
+            non_interoperable_kdf_required,
+        )
+        .context("Error performing key derivation")?;
+    let new_keys = fdo_http_wrapper::EncryptionKeys::from_derived(ciphersuite, new_keys);
+
+    // -------------------------------------------------------
+    // Step 5: DeviceSvcInfoRdy20(86) -> SetupDevice20(87)
+    //         ENCRYPTED from here on. No HMAC yet (moved to Done20).
+    //         Set encryption keys BEFORE sending (request must be encrypted).
+    // -------------------------------------------------------
+    client.set_encryption_keys(new_keys);
+    let svc_info_rdy = messages::v20::to2::DeviceSvcInfoRdy20::new(None);
+    let setup_device: RequestResult<messages::v20::to2::SetupDevice20> =
+        client.send_request(svc_info_rdy, None).await;
+    let setup_device = setup_device.context("Error sending DeviceSvcInfoRdy20")?;
+
+    log::trace!("SetupDevice20: {:?}", setup_device);
+
+    let nonce_to2_setup_dv = setup_device.nonce_to2_setup_dv().clone();
+
+    // -------------------------------------------------------
+    // Step 6: ServiceInfo exchange
+    //         DeviceSvcInfo20(88) <-> OwnerSvcInfo20(89) [encrypted loop]
+    // -------------------------------------------------------
+    let reboot_required = serviceinfo::perform_to2_serviceinfos(&mut client)
+        .await
+        .context("Error performing ServiceInfo exchange")?;
+
+    log::trace!("ServiceInfo complete, reboot_required: {reboot_required}");
+
+    // -------------------------------------------------------
+    // Step 7: Done20(90) -> DoneAck20(91)
+    //         HMAC sent HERE (after receiving replacement GUID/RvInfo)
+    // -------------------------------------------------------
+
+    // Mark onboarding performed
+    mark_device_onboarding_executed()
+        .context("Error creating device onboarding marker file")?;
+
+    // Deactivate credential
+    devcredloc
+        .deactivate()
+        .context("Error deactivating device credential")?;
+
+    // Compute replacement HMAC (or None for credential reuse)
+    // For credential reuse (-reuse-cred), send None
+    let replacement_hmac: Option<HMac> = None;
+
+    let done20 = messages::v20::to2::Done20::new(nonce_to2_setup_dv, replacement_hmac);
+    let done_ack: RequestResult<messages::v20::to2::DoneAck20> =
+        client.send_request(done20, None).await;
+    let done_ack = done_ack.context("Error sending Done20")?;
+
+    // Verify the nonce from ProveDevice20 came back
+    if &nonce_to2_prove_dv_prep != done_ack.nonce_to2_prove_ov() {
+        bail!("Nonce mismatch in DoneAck20");
     }
 
-    if devcredloc.deactivate().is_err() {
-        let e_result = ErrorResult::new(
-            ErrorCode::InternalServerError,
-            "Error deactivating device credential",
-            MessageType::TO2OwnerServiceInfo,
-            anyhow!("Error deactivating device credential"),
-        );
-        send_client_error(&mut client, &e_result).await;
-        bail!(e_result.error);
-    }
-
-    // Send: Done, Receive: Done2
-    match perform_done(nonce7, nonce6, &mut client).await {
-        Ok(_) => Ok(reboot_required),
-        Err(e) => match e {
-            ClientError::Request(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-            ClientError::Response(e) => {
-                send_client_error(&mut client, &e).await;
-                bail!(e.error);
-            }
-        },
-    }
+    log::info!("TO2 protocol complete (FDO 2.0)");
+    Ok(reboot_required)
 }
 
 fn get_delay_between_retries(rv_entry_delay: u32) -> u64 {
@@ -1127,9 +797,9 @@ async fn main() -> Result<()> {
         log::info!("Device credential deactivated, skipping Device Onboarding");
         return Ok(());
     }
-    if dc.protocol_version() != ProtocolVersion::Version1_1 {
+    if dc.protocol_version() != ProtocolVersion::Version2_0 {
         bail!(
-            "Device credential protocol version {} not supported",
+            "Device credential protocol version {} not supported (FDO 2.0 only)",
             dc.protocol_version()
         );
     }

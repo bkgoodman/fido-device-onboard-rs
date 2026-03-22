@@ -1042,6 +1042,7 @@ dependencies = [
  "rand",
  "secrecy",
  "serde_bytes",
+ "serde_cbor",
  "sys-info",
  "thiserror",
  "tokio",

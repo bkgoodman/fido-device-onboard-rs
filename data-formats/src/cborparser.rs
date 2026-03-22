@@ -1,3 +1,7 @@
+// Copyright (c) 2021, Red Hat, Inc.
+// Copyright (c) 2026, Dell Technologies, Inc.
+// SPDX-License-Identifier: BSD-3-Clause
+
 use byteorder::{BigEndian, ByteOrder};
 use paste::paste;
 use std::convert::TryInto;
@@ -262,19 +266,26 @@ impl<N: ParsedArraySize> Serializable for ParsedArray<N> {
 
                 Some(tag_val)
             }
-            MajorType::Array => None,
+            MajorType::Array | MajorType::Map => None,
             tp => return Err(Error::from(ArrayParseError::InvalidTopLevelType(tp))),
         };
 
         let first_major_type = MajorType::maybe_from_u8(singlebyte_buf[0] & MASK_TYPE)?;
-        if first_major_type != MajorType::Array {
+        if first_major_type != MajorType::Array && first_major_type != MajorType::Map {
             return Err(Error::from(ArrayParseError::InvalidTopLevelType(
                 first_major_type,
             )));
         }
 
-        let (map_len, mut map_len_bytes) = read_len(&mut reader, singlebyte_buf[0])?;
+        let (raw_len, mut map_len_bytes) = read_len(&mut reader, singlebyte_buf[0])?;
         header_buf.append(&mut map_len_bytes);
+
+        // For maps, each entry is 2 items (key + value), so total items = pairs * 2
+        let map_len = if first_major_type == MajorType::Map {
+            raw_len * 2
+        } else {
+            raw_len
+        };
 
         if let Some(expected_len) = N::SIZE {
             if map_len != expected_len {
@@ -343,7 +354,23 @@ impl<N: ParsedArraySize> Serializable for ParsedArray<N> {
                         left_at_depth.insert(0, length * 2);
                     }
                 }
-                n => return Err(ArrayParseError::UnsupportedMajorType(n as u8).into()),
+                MajorType::Tag => {
+                    let (_tag_value, mut len_bytes) = read_len(&mut reader, minor)?;
+                    toplevel_buf.append(&mut len_bytes);
+                    // Tag wraps the next item, so we need to read one more item
+                    left_at_depth.insert(0, 1);
+                }
+                MajorType::Special => {
+                    // Simple values (null, true, false, undefined) and floats
+                    // minor 20=false, 21=true, 22=null, 23=undefined
+                    // minor 24=simple(1 byte), 25=float16, 26=float32, 27=float64
+                    if minor <= 23 {
+                        // No additional bytes needed
+                    } else {
+                        let (_, mut val_bytes) = read_len(&mut reader, minor)?;
+                        toplevel_buf.append(&mut val_bytes);
+                    }
+                }
             }
 
             if left_at_depth.len() == 1 {

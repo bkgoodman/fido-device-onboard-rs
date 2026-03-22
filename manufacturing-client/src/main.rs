@@ -1,3 +1,7 @@
+// Copyright (c) 2021, Red Hat, Inc.
+// Copyright (c) 2026, Dell Technologies, Inc.
+// SPDX-License-Identifier: BSD-3-Clause
+
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use regex::Regex;
@@ -7,14 +11,14 @@ use std::{convert::TryFrom, fs};
 use std::{convert::TryInto, env, str::FromStr};
 
 use fdo_data_formats::{
-    constants::{HashType, HeaderKeys, KeyStorageType, MfgStringType, PublicKeyType},
+    constants::{HashType, HeaderKeys, KeyStorageType, MfgStringType, PublicKeyEncoding, PublicKeyType},
     devicecredential::{file::KeyStorage, FileDeviceCredential},
     enhanced_types::X5Bag,
     messages,
     publickey::PublicKey,
     types::{
-        CborSimpleType, CipherSuite, Guid, HMac, Hash, KexSuite, KeyDeriveSide, KeyExchange, Nonce,
-        RendezvousInfo,
+        CborSimpleType, CipherSuite, DeviceMfgInfo, Guid, HMac, Hash, KexSuite, KeyDeriveSide,
+        KeyExchange, Nonce, RendezvousInfo,
     },
     ProtocolVersion, Serializable,
 };
@@ -30,6 +34,7 @@ use openssl::{
     pkey::{PKey, Private},
     rsa::Rsa,
     sign::Signer,
+    x509::{X509NameBuilder, X509ReqBuilder},
 };
 
 use fdo_util::{device_credential_locations, device_identification};
@@ -80,6 +85,10 @@ struct PlainDIArgs {
     /// Available values: filesystem, tpm.
     #[clap(long)]
     key_ref: String,
+
+    /// FDO protocol version to use (101 for FDO 1.01, 110 for FDO 1.1, 200 for FDO 2.0)
+    #[clap(long, default_value = "110")]
+    fdo_version: u32,
 }
 
 #[derive(Args, Debug)]
@@ -104,6 +113,10 @@ struct NoPlainDIArgs {
     /// iface name for the MACAddress Device Identification string type.
     #[clap(long)]
     iface: Option<String>,
+
+    /// FDO protocol version to use (101 for FDO 1.01, 110 for FDO 1.1, 200 for FDO 2.0)
+    #[clap(long, default_value = "110")]
+    fdo_version: u32,
 }
 
 async fn perform_diun(
@@ -214,13 +227,30 @@ async fn perform_diun(
 
 async fn perform_di(
     client: &mut ServiceClient,
-    mut key_reference: KeyReference,
+    key_reference: KeyReference,
     mfg_string_type: MfgStringType,
     iface: Option<String>,
+    protocol_version: ProtocolVersion,
 ) -> Result<()> {
     let mfg_info = get_mfg_info(mfg_string_type, iface)
         .await
         .context("Error building MFG string")?;
+    
+    match protocol_version {
+        ProtocolVersion::Version2_0 => {
+            perform_di_v20(client, key_reference, mfg_info).await
+        }
+        _ => {
+            perform_di_v11(client, key_reference, mfg_info).await
+        }
+    }
+}
+
+async fn perform_di_v11(
+    client: &mut ServiceClient,
+    mut key_reference: KeyReference,
+    mfg_info: CborSimpleType,
+) -> Result<()> {
     let set_credentials: RequestResult<messages::v11::di::SetCredentials> = client
         .send_request(messages::v11::di::AppStart::new(mfg_info)?, None)
         .await;
@@ -242,11 +272,79 @@ async fn perform_di(
             ov_header.guid().clone(),
             ov_header.rendezvous_info().clone(),
             manufacturer_public_key_hash,
+            ProtocolVersion::Version1_1,
         )
         .context("Error saving key reference to credential")?;
 
     let done: RequestResult<messages::v11::di::Done> = client
         .send_request(messages::v11::di::SetHMAC::new(ov_header_hmac), None)
+        .await;
+    done.context("Error sending SetHmac")?;
+
+    Ok(())
+}
+
+async fn perform_di_v20(
+    client: &mut ServiceClient,
+    mut key_reference: KeyReference,
+    mfg_info: CborSimpleType,
+) -> Result<()> {
+    use fdo_data_formats::types::CapabilityFlags;
+
+    // Determine key type from the signing key
+    let key_type = key_reference.get_public_key_type()
+        .context("Error determining public key type")?;
+
+    // Generate a CSR using the device's signing key
+    let csr_der = key_reference.generate_csr()
+        .context("Error generating CSR for DeviceMfgInfo")?;
+
+    // Extract serial number and device info from mfg_info
+    let (serial_number, device_info) = match &mfg_info {
+        CborSimpleType::Text(s) => (s.clone(), s.clone()),
+        _ => ("unknown".to_string(), "unknown".to_string()),
+    };
+
+    // Build DeviceMfgInfo matching Go's custom.DeviceMfgInfo
+    let device_mfg_info = DeviceMfgInfo::new(
+        key_type,
+        PublicKeyEncoding::X509,
+        serial_number,
+        device_info,
+        csr_der,
+    );
+
+    let capability_flags = CapabilityFlags::new_v20_client();
+    let app_start = messages::v20::di::AppStart::new(&device_mfg_info, capability_flags);
+
+    let set_credentials: RequestResult<messages::v20::di::SetCredentials> = client
+        .send_request(app_start, None)
+        .await;
+    let set_credentials = set_credentials.context("Error sending AppStart")?;
+
+    let ov_header = set_credentials.into_ov_header();
+    let ov_header_buf = ov_header
+        .serialize_data()
+        .context("Error serializing Ownership Voucher header")?;
+    let ov_header_hmac = key_reference
+        .perform_hmac(&ov_header_buf)
+        .context("Error computing HMac over Ownership Voucher Header")?;
+    let manufacturer_public_key_hash = ov_header
+        .manufacturer_public_key_hash(HashType::Sha384)
+        .context("Error getting manufacturer public key hash")?;
+
+    key_reference
+        .save_to_credential(
+            ov_header.device_info().to_string(),
+            ov_header.guid().clone(),
+            ov_header.rendezvous_info().clone(),
+            manufacturer_public_key_hash,
+            ProtocolVersion::Version2_0,
+        )
+        .context("Error saving key reference to credential")?;
+
+    let done: RequestResult<messages::v20::di::Done> = client
+        .send_request(messages::v20::di::SetHMAC::new(ov_header_hmac), None)
         .await;
     done.context("Error sending SetHmac")?;
 
@@ -316,6 +414,7 @@ async fn main() -> Result<()> {
     let keyref: KeyReference;
     let mut iface: Option<String> = None;
     let mut client: ServiceClient;
+    let protocol_ver: ProtocolVersion;
 
     let args: MainArguments = clap::Parser::parse();
     if let Some(command) = args.command {
@@ -349,7 +448,16 @@ async fn main() -> Result<()> {
                 keyref = KeyReference::str_key(args.key_ref)
                     .await
                     .context("Error determining key for DI")?;
-                client = ServiceClient::new(ProtocolVersion::Version1_1, &url);
+                
+                // Convert fdo_version to ProtocolVersion
+                let protocol_version = match args.fdo_version {
+                    101 => ProtocolVersion::Version1_0,
+                    110 => ProtocolVersion::Version1_1,
+                    200 => ProtocolVersion::Version2_0,
+                    _ => bail!("Invalid FDO version: {}. Valid values are 101, 110, or 200", args.fdo_version),
+                };
+                client = ServiceClient::new(protocol_version, &url);
+                protocol_ver = protocol_version;
             }
             Commands::NoPlainDI(args) => {
                 url = args.manufacturing_server_url;
@@ -369,7 +477,17 @@ async fn main() -> Result<()> {
                 }
 
                 log::debug!("Performing DIUN");
-                client = ServiceClient::new(ProtocolVersion::Version1_1, &url);
+                
+                // Convert fdo_version to ProtocolVersion
+                let protocol_version = match args.fdo_version {
+                    101 => ProtocolVersion::Version1_0,
+                    110 => ProtocolVersion::Version1_1,
+                    200 => ProtocolVersion::Version2_0,
+                    _ => bail!("Invalid FDO version: {}. Valid values are 101, 110, or 200", args.fdo_version),
+                };
+                client = ServiceClient::new(protocol_version, &url);
+                protocol_ver = protocol_version;
+                
                 (keyref, mfg_string_type) = perform_diun(&mut client, diun_pub_key_verification)
                     .await
                     .context("Error performing DIUN")?;
@@ -400,7 +518,19 @@ async fn main() -> Result<()> {
 
         url = env::var("MANUFACTURING_SERVER_URL")
             .context("Please provide MANUFACTURING_SERVER_URL")?;
-        client = ServiceClient::new(ProtocolVersion::Version1_1, &url);
+        
+        // Parse FDO version from environment (defaults to 1.1)
+        let fdo_version: u32 = env::var("FDO_VERSION")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(110);
+        protocol_ver = match fdo_version {
+            101 => ProtocolVersion::Version1_0,
+            110 => ProtocolVersion::Version1_1,
+            200 => ProtocolVersion::Version2_0,
+            _ => bail!("Invalid FDO_VERSION: {}. Valid values are 101, 110, or 200", fdo_version),
+        };
+        client = ServiceClient::new(protocol_ver, &url);
 
         let use_plain_di = match env::var("USE_PLAIN_DI") {
             Ok(val) => val == "true",
@@ -475,7 +605,7 @@ async fn main() -> Result<()> {
         &mfg_string_type
     );
 
-    perform_di(&mut client, keyref, mfg_string_type, iface)
+    perform_di(&mut client, keyref, mfg_string_type, iface, protocol_ver)
         .await
         .context("Error performing DI")
 }
@@ -839,12 +969,83 @@ impl KeyReference {
         }
     }
 
+    /// Determine the FDO PublicKeyType from the signing key.
+    fn get_public_key_type(&self) -> Result<PublicKeyType> {
+        match self {
+            KeyReference::FileSystem { sign_key, .. } => {
+                match sign_key.id() {
+                    openssl::pkey::Id::EC => {
+                        let ec = sign_key.ec_key().context("Error getting EC key")?;
+                        match ec.group().curve_name() {
+                            Some(Nid::X9_62_PRIME256V1) => Ok(PublicKeyType::SECP256R1),
+                            Some(Nid::SECP384R1) => Ok(PublicKeyType::SECP384R1),
+                            _ => bail!("Unsupported EC curve"),
+                        }
+                    }
+                    openssl::pkey::Id::RSA => {
+                        match sign_key.bits() {
+                            2048 => Ok(PublicKeyType::Rsa2048RESTR),
+                            _ => Ok(PublicKeyType::RsaPkcs),
+                        }
+                    }
+                    _ => bail!("Unsupported key type"),
+                }
+            }
+            KeyReference::SemiTpm { .. } => {
+                // TPM keys are always SECP384R1 in this implementation
+                Ok(PublicKeyType::SECP384R1)
+            }
+        }
+    }
+
+    /// Generate an X.509 Certificate Signing Request (CSR) with CN=device.fdo-rs.
+    /// Returns DER-encoded CSR bytes.
+    /// The Go server validates the CSR signature, so it must be self-signed
+    /// with the device's signing key.
+    fn generate_csr(&self) -> Result<Vec<u8>> {
+        match self {
+            KeyReference::FileSystem { sign_key, .. } => {
+                let mut name_builder = X509NameBuilder::new()
+                    .context("Error creating X509 name builder")?;
+                name_builder.append_entry_by_text("CN", "device.fdo-rs")
+                    .context("Error setting CSR subject CN")?;
+                let name = name_builder.build();
+
+                let mut req_builder = X509ReqBuilder::new()
+                    .context("Error creating X509 request builder")?;
+                req_builder.set_subject_name(&name)
+                    .context("Error setting CSR subject name")?;
+                req_builder.set_pubkey(sign_key)
+                    .context("Error setting CSR public key")?;
+
+                // Choose digest based on key type
+                let digest = match sign_key.id() {
+                    openssl::pkey::Id::EC => {
+                        let bits = sign_key.bits();
+                        if bits <= 256 { MessageDigest::sha256() } else { MessageDigest::sha384() }
+                    }
+                    openssl::pkey::Id::RSA => MessageDigest::sha384(),
+                    _ => MessageDigest::sha256(),
+                };
+
+                req_builder.sign(sign_key, digest)
+                    .context("Error signing CSR")?;
+                let req = req_builder.build();
+                req.to_der().context("Error converting CSR to DER")
+            }
+            KeyReference::SemiTpm { .. } => {
+                bail!("CSR generation not yet supported for TPM keys")
+            }
+        }
+    }
+
     fn save_to_credential(
         self,
         device_info: String,
         guid: Guid,
         rvinfo: RendezvousInfo,
         manufacturer_public_key_hash: Hash,
+        protocol_version: ProtocolVersion,
     ) -> Result<()> {
         match self {
             KeyReference::FileSystem { sign_key, hmac_key } => {
@@ -854,7 +1055,7 @@ impl KeyReference {
 
                 let cred = FileDeviceCredential {
                     active: true,
-                    protver: ProtocolVersion::Version1_1,
+                    protver: protocol_version,
                     device_info,
                     guid,
                     rvinfo,
@@ -886,7 +1087,7 @@ impl KeyReference {
             } => {
                 let cred = FileDeviceCredential {
                     active: true,
-                    protver: ProtocolVersion::Version1_1,
+                    protver: protocol_version,
                     device_info,
                     guid,
                     rvinfo,

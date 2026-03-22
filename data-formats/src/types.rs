@@ -1,3 +1,7 @@
+// Copyright (c) 2021, Red Hat, Inc.
+// Copyright (c) 2026, Dell Technologies, Inc.
+// SPDX-License-Identifier: BSD-3-Clause
+
 use std::{
     convert::{TryFrom, TryInto},
     fmt::Display,
@@ -16,8 +20,9 @@ use serde_tuple::Serialize_tuple;
 use crate::{
     cborparser::{ParsedArray, ParsedArrayBuilder},
     constants::{
-        DeviceSigType, HashType, HeaderKeys, RendezvousVariable, ServiceInfoModule,
-        StandardServiceInfoModule, TransportProtocol,
+        DeviceSigType, HashType, HeaderKeys, PublicKeyEncoding, PublicKeyType,
+        RendezvousVariable, ServiceInfoModule,
+        StandardServiceInfoModule, TransportProtocol, EAT_UEID_CLAIM_KEY,
     },
     errors::Error,
     ownershipvoucher::OwnershipVoucher,
@@ -38,12 +43,46 @@ use openssl::{
 use openssl_kdf::{perform_kdf, KdfArgument, KdfKbMode, KdfMacType, KdfType};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize_tuple, Deserialize, Clone)]
+#[derive(Serialize_tuple, Clone)]
 pub struct Hash {
     hash_type: HashType,
 
     #[serde(with = "serde_bytes")]
     value: Vec<u8>,
+}
+
+// Custom Deserialize to accept both CBOR arrays and maps.
+// Needed because Go encodes structs as arrays but serde_cbor default expects maps.
+impl<'de> serde::Deserialize<'de> for Hash {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Hash;
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                f.write_str("Hash as array or map")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut s: A) -> core::result::Result<Hash, A::Error> {
+                let ht = s.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let v: serde_bytes::ByteBuf = s.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                Ok(Hash { hash_type: ht, value: v.into_vec() })
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut m: A) -> core::result::Result<Hash, A::Error> {
+                let mut ht = None; let mut v = None;
+                while let Some(k) = m.next_key::<String>()? {
+                    match k.as_str() {
+                        "hash_type" => ht = Some(m.next_value()?),
+                        "value" => { let b: serde_bytes::ByteBuf = m.next_value()?; v = Some(b.into_vec()); }
+                        _ => { let _: serde::de::IgnoredAny = m.next_value()?; }
+                    }
+                }
+                Ok(Hash { hash_type: ht.ok_or_else(|| serde::de::Error::missing_field("hash_type"))?, value: v.ok_or_else(|| serde::de::Error::missing_field("value"))? })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
 }
 
 impl std::fmt::Debug for Hash {
@@ -186,6 +225,129 @@ mod test_hash {
 }
 
 pub type HMac = Hash;
+
+// FDO Device Manufacturing Info - matches C/Java/Go client convention.
+// Not mandated by FDO spec, but required for interop with the ecosystem.
+// See go-fdo/custom/di.go for the Go definition.
+//
+// CBOR wire format (array, not map - Go cbor encodes structs as arrays):
+//   [KeyType, KeyEncoding, SerialNumber, DeviceInfo, CertInfo]
+#[derive(Debug, Clone, Serialize_tuple, Deserialize)]
+pub struct DeviceMfgInfo {
+    pub key_type: PublicKeyType,
+    pub key_encoding: PublicKeyEncoding,
+    pub serial_number: String,
+    pub device_info: String,
+    #[serde(with = "serde_bytes")]
+    pub csr_der: Vec<u8>,
+}
+
+impl DeviceMfgInfo {
+    pub fn new(
+        key_type: PublicKeyType,
+        key_encoding: PublicKeyEncoding,
+        serial_number: String,
+        device_info: String,
+        csr_der: Vec<u8>,
+    ) -> Self {
+        Self {
+            key_type,
+            key_encoding,
+            serial_number,
+            device_info,
+            csr_der,
+        }
+    }
+}
+
+// FDO 2.0: Capability Flags for version negotiation and feature detection.
+// Serialized as CBOR array to match Go cbor library encoding.
+// Go's cbor:",omitempty" omits VendorUnique when nil, so the array may
+// have 1 or 2 elements.  We use Serialize_tuple for encoding and a custom
+// Deserialize to accept both lengths.
+#[derive(Clone, Debug, Serialize_tuple)]
+pub struct CapabilityFlags {
+    #[serde(with = "serde_bytes")]
+    pub flags: Vec<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor_unique: Option<Vec<String>>,
+}
+
+impl<'de> serde::Deserialize<'de> for CapabilityFlags {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = CapabilityFlags;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a CBOR array of 1 or 2 elements")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<CapabilityFlags, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let flags: serde_bytes::ByteBuf = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let vendor_unique: Option<Vec<String>> = seq.next_element()?;
+                Ok(CapabilityFlags {
+                    flags: flags.into_vec(),
+                    vendor_unique: vendor_unique.and_then(|v| if v.is_empty() { None } else { Some(v) }),
+                })
+            }
+        }
+        deserializer.deserialize_seq(Visitor)
+    }
+}
+
+// Capability flag bit definitions
+pub const CAPB0_SUP_FDO10: u8 = 1 << 0; // bit 0: Sender supports FDO 1.0
+pub const CAPB0_SUP_FDO11: u8 = 1 << 1; // bit 1: Sender supports FDO 1.1
+pub const CAPB0_SUP_FDO20: u8 = 1 << 2; // bit 2: Sender supports FDO 2.0
+pub const DELEGATE_SUPPORT: u8 = 1 << 7; // bit 7: Delegate support
+
+impl CapabilityFlags {
+    /// Create capability flags for FDO 2.0 client (no delegate support by default)
+    pub fn new_v20_client() -> Self {
+        Self {
+            flags: vec![CAPB0_SUP_FDO20],
+            vendor_unique: None,
+        }
+    }
+
+    /// Create capability flags with optional delegate support
+    pub fn new_v20_client_with_delegate(support_delegate: bool) -> Self {
+        let mut flags = CAPB0_SUP_FDO20;
+        if support_delegate {
+            flags |= DELEGATE_SUPPORT;
+        }
+        Self {
+            flags: vec![flags],
+            vendor_unique: None,
+        }
+    }
+
+    /// Check if a specific FDO version is supported
+    pub fn supports_version(&self, version: crate::ProtocolVersion) -> bool {
+        if self.flags.is_empty() {
+            return false;
+        }
+        match version {
+            crate::ProtocolVersion::Version1_0 => self.flags[0] & CAPB0_SUP_FDO10 != 0,
+            crate::ProtocolVersion::Version1_1 => self.flags[0] & CAPB0_SUP_FDO11 != 0,
+            crate::ProtocolVersion::Version2_0 => self.flags[0] & CAPB0_SUP_FDO20 != 0,
+        }
+    }
+
+    /// Check if delegate support is enabled
+    pub fn supports_delegate(&self) -> bool {
+        !self.flags.is_empty() && self.flags[0] & DELEGATE_SUPPORT != 0
+    }
+}
 
 #[derive(Clone, Debug, Serialize_tuple, Deserialize)]
 pub struct SigInfo {
@@ -441,7 +603,7 @@ impl RendezvousInfo {
                 let value = value.serialize_data()?;
                 let value = ByteBuf::from(value);
 
-                out_directive.push((variable, value));
+                out_directive.push(RendezvousInstruction::WithValue(variable, value));
             }
 
             out.push(out_directive);
@@ -456,7 +618,83 @@ impl RendezvousInfo {
 }
 
 pub type RendezvousDirective = Vec<RendezvousInstruction>;
-pub type RendezvousInstruction = (RendezvousVariable, ByteBuf);
+
+// A rendezvous instruction is [variable] or [variable, value].
+// Go encodes RVBypass, RVOwnerOnly, etc. as 1-element arrays with no value.
+#[derive(Debug, Clone)]
+pub enum RendezvousInstruction {
+    WithValue(RendezvousVariable, ByteBuf),
+    FlagOnly(RendezvousVariable),
+}
+
+impl serde::Serialize for RendezvousInstruction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        match self {
+            RendezvousInstruction::WithValue(var, val) => {
+                let mut seq = serializer.serialize_seq(Some(2))?;
+                seq.serialize_element(var)?;
+                seq.serialize_element(val)?;
+                seq.end()
+            }
+            RendezvousInstruction::FlagOnly(var) => {
+                let mut seq = serializer.serialize_seq(Some(1))?;
+                seq.serialize_element(var)?;
+                seq.end()
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RendezvousInstruction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = RendezvousInstruction;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a CBOR array of 1 or 2 elements [variable] or [variable, value]")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<RendezvousInstruction, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let var: RendezvousVariable = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let val: Option<ByteBuf> = seq.next_element()?;
+                match val {
+                    Some(v) => Ok(RendezvousInstruction::WithValue(var, v)),
+                    None => Ok(RendezvousInstruction::FlagOnly(var)),
+                }
+            }
+        }
+        deserializer.deserialize_seq(Visitor)
+    }
+}
+
+impl RendezvousInstruction {
+    pub fn variable(&self) -> RendezvousVariable {
+        match self {
+            RendezvousInstruction::WithValue(v, _) => *v,
+            RendezvousInstruction::FlagOnly(v) => *v,
+        }
+    }
+
+    pub fn value(&self) -> Option<&ByteBuf> {
+        match self {
+            RendezvousInstruction::WithValue(_, v) => Some(v),
+            RendezvousInstruction::FlagOnly(_) => None,
+        }
+    }
+}
 
 // TODO: This sends serde_cbor outwards. Possibly re-do this
 pub type CborSimpleType = serde_cbor::Value;
@@ -729,6 +967,111 @@ impl TO2ProveDevicePayload {
 
     pub fn b_key_exchange(&self) -> &[u8] {
         &self.b_key_exchange
+    }
+}
+
+// FDO 2.0 TO2 ProveDevice20 EAT payload.
+// Device sends this FIRST (anti-DoS).
+// Contains device's key exchange parameter A (device generates xA).
+#[derive(Debug, Serialize_tuple, Deserialize)]
+pub struct TO2ProveDevice20Payload {
+    pub kex_suite_name: KexSuite,
+    pub cipher_suite_name: CipherSuite,
+    #[serde(with = "serde_bytes")]
+    pub xa_key_exchange: Vec<u8>,
+    pub nonce_to2_prove_ov_prep: Nonce,
+    pub hash_prev2: Hash,
+}
+
+impl TO2ProveDevice20Payload {
+    pub fn new(
+        kex_suite_name: KexSuite,
+        cipher_suite_name: CipherSuite,
+        xa_key_exchange: Vec<u8>,
+        nonce_to2_prove_ov_prep: Nonce,
+        hash_prev2: Hash,
+    ) -> Self {
+        Self {
+            kex_suite_name,
+            cipher_suite_name,
+            xa_key_exchange,
+            nonce_to2_prove_ov_prep,
+            hash_prev2,
+        }
+    }
+}
+
+// FDO 2.0 TO2 ProveOVHdr20 payload (inside COSE_Sign1 from server).
+// Server sends this AFTER verifying device.
+// Contains server's key exchange parameter B.
+#[derive(Debug)]
+pub struct TO2ProveOVHdr20Payload {
+    contents: ParsedArray<crate::cborparser::ParsedArraySize6>,
+
+    cached_ov_header: ByteBuf,
+    cached_num_ov_entries: u8,
+    cached_hmac: HMac,
+    cached_nonce_to2_prove_ov: Nonce,
+    cached_xb_key_exchange: ByteBuf,
+    cached_max_owner_message_size: u16,
+}
+
+impl Serializable for TO2ProveOVHdr20Payload {
+    fn deserialize_from_reader<R>(reader: R) -> Result<Self, Error>
+    where
+        R: std::io::Read,
+    {
+        let contents = ParsedArray::deserialize_from_reader(reader)?;
+
+        let cached_ov_header = contents.get(0)?;
+        let cached_num_ov_entries = contents.get(1)?;
+        let cached_hmac = contents.get(2)?;
+        let cached_nonce_to2_prove_ov = contents.get(3)?;
+        let cached_xb_key_exchange = contents.get(4)?;
+        let cached_max_owner_message_size = contents.get(5)?;
+
+        Ok(TO2ProveOVHdr20Payload {
+            contents,
+            cached_ov_header,
+            cached_num_ov_entries,
+            cached_hmac,
+            cached_nonce_to2_prove_ov,
+            cached_xb_key_exchange,
+            cached_max_owner_message_size,
+        })
+    }
+
+    fn serialize_to_writer<W>(&self, writer: W) -> Result<(), Error>
+    where
+        W: std::io::Write,
+    {
+        self.contents.serialize_to_writer(writer)
+    }
+}
+
+impl TO2ProveOVHdr20Payload {
+    pub fn ov_header(&self) -> &[u8] {
+        &self.cached_ov_header
+    }
+
+    pub fn num_ov_entries(&self) -> u16 {
+        self.cached_num_ov_entries as u16
+    }
+
+    pub fn hmac(&self) -> &HMac {
+        &self.cached_hmac
+    }
+
+    pub fn nonce_to2_prove_ov(&self) -> &Nonce {
+        &self.cached_nonce_to2_prove_ov
+    }
+
+    pub fn xb_key_exchange(&self) -> &[u8] {
+        &self.cached_xb_key_exchange
+    }
+
+    pub fn max_owner_message_size(&self) -> u16 {
+        self.cached_max_owner_message_size
     }
 }
 
@@ -1560,8 +1903,8 @@ where
         }
         res.insert(HeaderKeys::EatNonce, &self.nonce)
             .expect("Error adding to res");
-        res.insert(
-            HeaderKeys::EatUeid,
+        res.insert_raw(
+            EAT_UEID_CLAIM_KEY,
             &serde_bytes::ByteBuf::from(self.device_guid.clone()),
         )
         .expect("Error adding to res");
@@ -1640,7 +1983,7 @@ where
         None => return Err(Error::InconsistentValue("Missing nonce")),
         Some(val) => serde_cbor::value::from_value(val)?,
     };
-    let ueid: serde_bytes::ByteBuf = match claims.0.remove(&(HeaderKeys::EatUeid as i64)) {
+    let ueid: serde_bytes::ByteBuf = match claims.0.remove(&EAT_UEID_CLAIM_KEY) {
         None => return Err(Error::InconsistentValue("Missing UEID")),
         Some(val) => {
             let val: serde_bytes::ByteBuf = serde_cbor::value::from_value(val)?;
@@ -1714,6 +2057,15 @@ impl COSEHeaderMap {
     {
         self.0
             .insert(key as i64, serde_cbor::value::to_value(value)?);
+        Ok(())
+    }
+
+    pub fn insert_raw<T>(&mut self, key: i64, value: &T) -> Result<(), Error>
+    where
+        T: Serialize,
+    {
+        self.0
+            .insert(key, serde_cbor::value::to_value(value)?);
         Ok(())
     }
 
@@ -1868,6 +2220,19 @@ impl COSESign {
         Ok(UnverifiedValue(T::deserialize_data(&payload)?))
     }
 
+    /// Get raw payload bytes without verification or deserialization (for debugging).
+    pub fn get_payload_unverified_raw(&self) -> Result<Vec<u8>, Error> {
+        Ok(self.cached_inner.get_payload::<Openssl>(None)?)
+    }
+
+    /// Get the raw unprotected header map info for debugging.
+    pub fn get_unprotected_raw(&self) -> String {
+        let hm = self.cached_inner.get_unprotected();
+        let has_257 = hm.get(&serde_cbor::Value::Integer(257)).is_some();
+        let has_258 = hm.get(&serde_cbor::Value::Integer(258)).is_some();
+        format!("empty={}, has_owner_key(257)={}, has_delegate(258)={}", hm.is_empty(), has_257, has_258)
+    }
+
     pub fn get_payload<T>(&self, key: &dyn SigningPublicKey) -> Result<T, Error>
     where
         T: Serializable,
@@ -1936,6 +2301,41 @@ impl COSESign {
             None => Ok(None),
             Some(val) => Ok(Some(serde_cbor::value::from_value(val.clone())?)),
         }
+    }
+
+    /// Get a value from the COSE unprotected header using raw byte extraction.
+    /// Parses the unprotected header map as a sequence of key-value pairs using
+    /// ParsedArray to extract the raw bytes for the target key's value.
+    /// This avoids any CborValue intermediary which can lose integer type info.
+    pub fn get_unprotected_serializable<T>(&self, key: HeaderKeys) -> Result<Option<T>, Error>
+    where
+        T: Serializable,
+    {
+        // Get raw COSE bytes from our ParsedArray (preserves original Go encoding)
+        let cose_bytes = self.contents.serialize_data()?;
+        use crate::cborparser::{ParsedArray, ParsedArraySize4, ParsedArraySizeDynamic};
+        let arr: ParsedArray<ParsedArraySize4> = ParsedArray::deserialize_data(&cose_bytes)?;
+        let map_bytes = arr.get_raw(1);
+
+        // Parse the unprotected header map as a ParsedArray (now supports maps).
+        // Map items are stored as alternating key-value pairs.
+        let items: ParsedArray<ParsedArraySizeDynamic> =
+            ParsedArray::deserialize_data(map_bytes)?;
+
+        let target = key as i64;
+        let num_items = items.len();
+        for i in (0..num_items).step_by(2) {
+            let key_bytes = items.get_raw(i);
+            if let Ok(ki) = serde_cbor::from_slice::<i64>(key_bytes) {
+                if ki == target && i + 1 < num_items {
+                    // Found! The value is at position i+1, as raw CBOR bytes
+                    let val_bytes = items.get_raw(i + 1);
+                    log::warn!("Delegate raw value bytes ({} bytes, first 10): {:02x?}", val_bytes.len(), &val_bytes[..std::cmp::min(10, val_bytes.len())]);
+                    return Ok(Some(T::deserialize_data(val_bytes)?));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 

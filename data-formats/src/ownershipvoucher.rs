@@ -1,10 +1,13 @@
-use std::collections::HashMap;
+// Copyright (c) 2021, Red Hat, Inc.
+// Copyright (c) 2026, Dell Technologies, Inc.
+// SPDX-License-Identifier: BSD-3-Clause
+
 use std::ops::Range;
 
 use openssl::pkey::{PKeyRef, Private};
 use serde::Deserialize;
 use serde_bytes::ByteBuf;
-use serde_tuple::Serialize_tuple;
+use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::{
     cborparser::{
@@ -21,8 +24,10 @@ use crate::{
 const VOUCHER_PEM_TAG: &str = "OWNERSHIP VOUCHER";
 const ACCEPTABLE_ASCII_RANGE: Range<u8> = 32..127;
 
-type ExtraType = Option<HashMap<u128, ByteBuf>>;
-type RefExtraType<'a> = Option<&'a HashMap<u128, ByteBuf>>;
+// ExtraType: Go encodes this as cbor.Bstr[map[int][]byte] - a byte string wrapping a CBOR map.
+// We store it as raw bytes (ByteBuf) to handle both Go's Bstr encoding and direct null.
+type ExtraType = Option<ByteBuf>;
+type RefExtraType<'a> = Option<&'a ByteBuf>;
 
 #[derive(Debug)]
 enum OwnershipVoucherIndex {
@@ -383,8 +388,8 @@ impl EntryIter<'_> {
         &mut self,
         entry: OwnershipVoucherEntry,
     ) -> Result<OwnershipVoucherEntryPayload> {
-        let entry = entry.0;
-        let entry: OwnershipVoucherEntryPayload = entry.get_payload(self.last_pubkey.pkey())?;
+        let entry_cose = entry.0;
+        let entry: OwnershipVoucherEntryPayload = entry_cose.get_payload(self.last_pubkey.pkey())?;
 
         // Compare the HashPreviousEntry to either (HeaderTag || HeaderHmac) or the previous entry
         let hash_previous_entry = if self.index == 0 {
@@ -644,12 +649,55 @@ impl std::ops::Deref for OwnershipVoucherEntry {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize_tuple, Clone)]
+#[derive(Debug, Clone)]
 pub struct OwnershipVoucherEntryPayload {
     hash_previous_entry: Hash,
     hash_header_info: Hash,
     extra: ExtraType,
     public_key: PublicKey,
+}
+
+// Custom Serializable using ciborium for deserialization.
+// The blanket impl uses serde_cbor which expects CBOR maps for struct deserialization,
+// but Go encodes structs as CBOR arrays. ciborium handles both formats.
+// We can't derive Serialize+Deserialize because that would trigger the conflicting blanket impl.
+impl crate::Serializable for OwnershipVoucherEntryPayload {
+    fn deserialize_from_reader<R>(reader: R) -> Result<Self>
+    where
+        R: std::io::Read,
+    {
+        // Deserialize as a ParsedArray to handle CBOR array encoding from Go.
+        // Go encodes structs as arrays, but serde's Deserialize expects maps.
+        use crate::cborparser::{ParsedArray, ParsedArraySize4};
+        let arr: ParsedArray<ParsedArraySize4> = ParsedArray::deserialize_from_reader(reader)?;
+        let hash_previous_entry: Hash = arr.get(0)?;
+        let hash_header_info: Hash = arr.get(1)?;
+        let extra: ExtraType = arr.get(2)?;
+        let public_key: PublicKey = arr.get(3)?;
+        Ok(Self {
+            hash_previous_entry,
+            hash_header_info,
+            extra,
+            public_key,
+        })
+    }
+
+    fn deserialize_data(data: &[u8]) -> Result<Self> {
+        Self::deserialize_from_reader(data)
+    }
+
+    fn serialize_to_writer<W>(&self, mut writer: W) -> Result<()>
+    where
+        W: std::io::Write,
+    {
+        use crate::cborparser::{ParsedArrayBuilder, ParsedArraySize4};
+        let mut arr = ParsedArrayBuilder::<ParsedArraySize4>::new();
+        arr.set(0, &self.hash_previous_entry)?;
+        arr.set(1, &self.hash_header_info)?;
+        arr.set(2, &self.extra)?;
+        arr.set(3, &self.public_key)?;
+        arr.build().serialize_to_writer(writer)
+    }
 }
 
 impl OwnershipVoucherEntryPayload {
@@ -681,5 +729,56 @@ impl OwnershipVoucherEntryPayload {
 
     pub fn public_key(&self) -> &PublicKey {
         &self.public_key
+    }
+}
+
+#[cfg(test)]
+mod tests_ov_entry {
+    use super::*;
+    use crate::Serializable;
+
+    #[test]
+    fn test_ov_entry_payload_deserialize_from_array() {
+        // The COSE payload bytes from the Go server's OV entry
+        // First byte 0x84 = CBOR array(4)
+        let payload_bytes: Vec<u8> = vec![
+            0x84, // array(4)
+            0x82, 0x2f, 0x58, 0x20, // Hash: [Sha256(-16), bytes(32)]
+            0x6f, 0x2b, 0x1e, 0x1c, 0x8f, 0x8c, 0x26, 0x63, 0x5e, 0xf7, 0x32, 0xff,
+            0x60, 0x80, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x82, 0x2f, 0x58, 0x20, // Hash: [Sha256(-16), bytes(32)]
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x41, 0xa0, // extra: bytes(1) 0xa0  OR  empty map
+            0x83, 0x0a, 0x01, 0x41, 0x00, // PublicKey: [10, 1, bytes(1)]
+        ];
+        
+        // Try to deserialize with custom Serializable (uses ParsedArray)
+        let result = OwnershipVoucherEntryPayload::deserialize_data(&payload_bytes);
+        match result {
+            Ok(_) => println!("serde_cbor deserialization succeeded"),
+            Err(e) => println!("serde_cbor deserialization failed: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_ov_entry_cose_roundtrip() {
+        // Actual OV entry bytes from Go FDO server's TO2.OVNextEntry20 response
+        let entry_hex = "d28443a10126a058ab84822f5820c71d7110ca19380db5fe9f25767cc03d5bda5d20b1f56e97687fba79139acf6c822f5820c4347dcd86249676720e60b16f1dc213a9dbab6c34a744781c32f20d1e1a472d41a0830a01585b3059301306072a8648ce3d020106082a8648ce3d03010703420004c635bbfddca7499345d35e1e86ffddc1ad5287a58b51d5450109229093b28f4a1f9212db16390b2b63ee2c501efb905324a8f461bcbc253761c4fae070cd4b935840474effc48c7aeebd5d2d27071682c559dd9ab81c9866eec9eeae479a7f94bb54ce0c91b6666f15790376e16538f4143fba8a80455775c73fe0e7f2f077fad7e9";
+        let entry_bytes = hex::decode(entry_hex).unwrap();
+
+        // Step 1: Deserialize from raw bytes
+        let entry = OwnershipVoucherEntry::deserialize_data(&entry_bytes)
+            .expect("Failed to deserialize OV entry from Go server bytes");
+
+        // Step 2: Re-serialize
+        let reserialized = entry.serialize_data()
+            .expect("Failed to re-serialize OV entry");
+
+        // Step 3: Deserialize again (round-trip)
+        let _entry2 = OwnershipVoucherEntry::deserialize_data(&reserialized)
+            .expect("Failed to deserialize OV entry after round-trip");
     }
 }

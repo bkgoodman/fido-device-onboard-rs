@@ -1,3 +1,7 @@
+// Copyright (c) 2021, Red Hat, Inc.
+// Copyright (c) 2026, Dell Technologies, Inc.
+// SPDX-License-Identifier: BSD-3-Clause
+
 use std::{convert::TryFrom, str::FromStr};
 
 use serde::{Deserialize, Serialize};
@@ -165,6 +169,10 @@ impl ServiceClient {
         self.non_interoperable_kdf_required
     }
 
+    pub fn set_encryption_keys(&mut self, keys: EncryptionKeys) {
+        self.encryption_keys = keys;
+    }
+
     pub async fn send_request<OM, SM>(
         &mut self,
         to_send: OM,
@@ -297,9 +305,23 @@ impl ServiceClient {
 
         if is_success {
             let resp = self.encryption_keys.decrypt(&resp)?;
+            log::trace!("Decrypted: {:?}", hex::encode(&resp));
             Ok(SM::deserialize_data(&resp)?)
         } else {
-            Err(Error::Error(ErrorMessage::deserialize_data(&resp)?))
+            log::warn!("Server returned error, raw bytes: {:?}", hex::encode(&resp));
+            // Try to parse error, handle null correlation ID gracefully
+            match ErrorMessage::deserialize_data(&resp) {
+                Ok(err) => Err(Error::Error(err)),
+                Err(parse_err) => {
+                    log::warn!("Could not parse error message: {:?}", parse_err);
+                    Err(Error::Error(ErrorMessage::new(
+                        fdo_data_formats::constants::ErrorCode::InternalServerError,
+                        SM::message_type(),
+                        format!("Server error (unparseable): {}", hex::encode(&resp)),
+                        0,
+                    )))
+                }
+            }
         }
     }
 }

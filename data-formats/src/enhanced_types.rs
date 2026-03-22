@@ -1,3 +1,7 @@
+// Copyright (c) 2021, Red Hat, Inc.
+// Copyright (c) 2026, Dell Technologies, Inc.
+// SPDX-License-Identifier: BSD-3-Clause
+
 use std::collections::HashMap;
 
 use openssl::{hash::MessageDigest, pkey::PKeyRef, x509::X509};
@@ -54,7 +58,16 @@ impl RendezvousInterpretedDirective {
 
         if let Some(ip_addresses) = self.ip_addresses.as_ref() {
             for ip_address in ip_addresses {
-                urls.push(format!("{}://{}:{}", protocol_text, ip_address, self.port));
+                // Convert IPv6-mapped IPv4 (::ffff:x.x.x.x) to plain IPv4 for URL
+                let addr_str = ip_address.to_string();
+                let ip_for_url = if let Some(v4) = addr_str.strip_prefix("::ffff:") {
+                    v4.to_string()
+                } else if addr_str.contains(':') {
+                    format!("[{}]", addr_str) // bracket IPv6 addresses
+                } else {
+                    addr_str
+                };
+                urls.push(format!("{}://{}:{}", protocol_text, ip_for_url, self.port));
             }
         }
 
@@ -79,8 +92,15 @@ impl RendezvousInterpretedDirective {
         let mut delay = 0;
         let mut bypass = false;
 
-        for (variable, value) in info {
-            let value = CborSimpleType::deserialize_data(value)?;
+        for instruction in info {
+            let variable = instruction.variable();
+            // Flag-only instructions (like Bypass, OwnerOnly, DeviceOnly) have no value
+            let value_bytes = instruction.value();
+            // For instructions with values, deserialize; for flags, use a dummy
+            let value: CborSimpleType = match value_bytes {
+                Some(v) => CborSimpleType::deserialize_data(v)?,
+                None => CborSimpleType::Bool(true), // flag-only instruction
+            };
             match variable {
                 RendezvousVariable::DeviceOnly => {
                     if side != RendezvousInterpreterSide::Device {
@@ -102,6 +122,10 @@ impl RendezvousInterpretedDirective {
                 }
                 RendezvousVariable::OwnerPort => {
                     if side == RendezvousInterpreterSide::Owner {
+                        port = Some(from_value(value.clone())?);
+                    }
+                    // Also use OwnerPort on Device side as fallback (for bypass mode)
+                    if side == RendezvousInterpreterSide::Device && port.is_none() {
                         port = Some(from_value(value.clone())?);
                     }
                 }
@@ -167,10 +191,9 @@ impl RendezvousInterpretedDirective {
                 None => match protocol.default_port() {
                     Some(v) => v,
                     None => {
-                        return Err(<serde_cbor::Error as serde::de::Error>::missing_field(
-                            "No default port",
-                        )
-                        .into())
+                        // No port and no default - skip this directive
+                        // (e.g. metadata-only directives like Delaysec)
+                        return Ok(None);
                     }
                 },
             },
