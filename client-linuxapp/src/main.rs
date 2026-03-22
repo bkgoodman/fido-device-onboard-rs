@@ -11,16 +11,14 @@ use thiserror::Error;
 use fdo_data_formats::{
     cborparser::ParsedArray,
     constants::{
-        DeviceSigType, ErrorCode, HeaderKeys, MessageType, RendezvousProtocolValue,
-        TransportProtocol,
+        DeviceSigType, ErrorCode, MessageType, RendezvousProtocolValue, TransportProtocol,
     },
     enhanced_types::{RendezvousInterpretedDirective, RendezvousInterpreterSide},
     messages,
     ownershipvoucher::{OwnershipVoucher, OwnershipVoucherHeader},
     types::{
-        new_eat, COSEHeaderMap, COSESign, CipherSuite, EATokenPayload, HMac, KexSuite,
-        KeyDeriveSide, KeyExchange, Nonce, PayloadCreating, SigInfo, TO1DataPayload,
-        TO2AddressEntry, TO2ProveDevicePayload, TO2ProveOVHdrPayload, UnverifiedValue,
+        new_eat, COSESign, CipherSuite, EATokenPayload, HMac, KexSuite, KeyDeriveSide, KeyExchange,
+        Nonce, PayloadCreating, SigInfo, TO1DataPayload, TO2AddressEntry, UnverifiedValue,
     },
     DeviceCredential, ProtocolVersion, Serializable,
 };
@@ -28,7 +26,6 @@ use fdo_http_wrapper::client::{RequestResult, ServiceClient};
 use fdo_util::device_credential_locations;
 use fdo_util::device_credential_locations::UsableDeviceCredentialLocation;
 
-mod reencrypt;
 mod serviceinfo;
 
 const DEVICE_ONBOARDING_EXECUTED_MARKER_FILE: &str = "/etc/device_onboarding_performed";
@@ -127,9 +124,7 @@ fn get_to2_urls(entries: &[TO2AddressEntry]) -> Vec<String> {
     urls
 }
 
-async fn get_client_list(
-    rv_entry: &RendezvousInterpretedDirective,
-) -> Result<Vec<ServiceClient>> {
+async fn get_client_list(rv_entry: &RendezvousInterpretedDirective) -> Result<Vec<ServiceClient>> {
     log::trace!("Getting client list from rv_entry {:?}", rv_entry);
     let mut service_client_list = Vec::new();
 
@@ -300,7 +295,7 @@ fn get_rv_info(devcred: &dyn DeviceCredential) -> Result<Vec<RendezvousInterpret
     // Debug: Show raw RV info
     let rv_raw = devcred.rendezvous_info();
     log::info!("Raw RV info directives: {:?}", rv_raw.values());
-    
+
     let rv_info = rv_raw
         .to_interpreted(RendezvousInterpreterSide::Device)
         .context("Error parsing rendezvous directives")?;
@@ -376,7 +371,7 @@ async fn get_ov_entries_v20(
     Ok(entries)
 }
 
-async fn get_nonce(message_type: MessageType) -> Result<Nonce, ClientError> {
+async fn _get_nonce(message_type: MessageType) -> Result<Nonce, ClientError> {
     Nonce::new().context("Error generating nonce").map_err(|e| {
         ClientError::Response(ErrorResult::new(
             ErrorCode::InternalServerError,
@@ -400,19 +395,17 @@ async fn perform_to2(
 
     log::info!("Performing TO2 protocol (FDO 2.0), URL: {:?}", url);
 
-    let mut client =
-        fdo_http_wrapper::client::ServiceClient::new(ProtocolVersion::Version2_0, url);
+    let mut client = fdo_http_wrapper::client::ServiceClient::new(ProtocolVersion::Version2_0, url);
 
     let kexsuite = KexSuite::Ecdh384;
     let ciphersuite = CipherSuite::A256Gcm;
-    let sigtype = DeviceSigType::StSECP384R1;
+    let _sigtype = DeviceSigType::StSECP384R1;
 
     // -------------------------------------------------------
     // Step 1: HelloDeviceProbe(80) -> HelloDeviceAck20(81)
     // -------------------------------------------------------
     let mut sugar = [0u8; 16];
-    openssl::rand::rand_bytes(&mut sugar)
-        .context("Error generating random sugar")?;
+    openssl::rand::rand_bytes(&mut sugar).context("Error generating random sugar")?;
 
     let hello_probe = messages::v20::to2::HelloDeviceProbe::new(
         devcred.device_guid().clone(),
@@ -422,7 +415,7 @@ async fn perform_to2(
     );
 
     // Serialize the probe for hash-binding later
-    let hello_probe_bytes = hello_probe
+    let _hello_probe_bytes = hello_probe
         .serialize_data()
         .context("Error serializing HelloDeviceProbe for hash binding")?;
 
@@ -444,18 +437,16 @@ async fn perform_to2(
     // -------------------------------------------------------
 
     // Generate device-side key exchange parameter A
-    let a_key_exchange = KeyExchange::new(kexsuite)
-        .context("Error creating device-side key exchange")?;
+    let a_key_exchange =
+        KeyExchange::new(kexsuite).context("Error creating device-side key exchange")?;
     let xa_public = a_key_exchange
         .get_public()
         .context("Error getting device key exchange public")?;
 
     // Compute hash of HelloDeviceAck20 for binding
-    let hash_prev2 = fdo_data_formats::types::Hash::from_data(
-        FdoHashType::Sha384,
-        &hello_ack_bytes,
-    )
-    .context("Error computing hash of HelloDeviceAck20")?;
+    let hash_prev2 =
+        fdo_data_formats::types::Hash::from_data(FdoHashType::Sha384, &hello_ack_bytes)
+            .context("Error computing hash of HelloDeviceAck20")?;
 
     // Build ProveDevice20 payload.
     // NonceTO2ProveOVPrep echoes the server's NonceTO2ProveDVPrep (anti-replay).
@@ -499,12 +490,8 @@ async fn perform_to2(
 
     // Verify HMAC of ownership voucher header
     {
-        let ov_hdr_vec = prove_ov_hdr_payload
-            .get_unverified_value()
-            .ov_header();
-        let ov_hdr_hmac = prove_ov_hdr_payload
-            .get_unverified_value()
-            .hmac();
+        let ov_hdr_vec = prove_ov_hdr_payload.get_unverified_value().ov_header();
+        let ov_hdr_hmac = prove_ov_hdr_payload.get_unverified_value().hmac();
         devcred
             .verify_hmac(ov_hdr_vec, ov_hdr_hmac)
             .context("Error verifying OV header HMAC")?;
@@ -525,10 +512,7 @@ async fn perform_to2(
             .context("Manufacturer public key hash mismatch")?;
     }
 
-    let header_hmac = prove_ov_hdr_payload
-        .get_unverified_value()
-        .hmac()
-        .clone();
+    let header_hmac = prove_ov_hdr_payload.get_unverified_value().hmac().clone();
 
     // -------------------------------------------------------
     // Step 3: GetOVNextEntry20(84) -> OVNextEntry20(85) [loop]
@@ -536,21 +520,14 @@ async fn perform_to2(
     // -------------------------------------------------------
     let ov_entries = get_ov_entries_v20(
         &mut client,
-        prove_ov_hdr_payload
-            .get_unverified_value()
-            .num_ov_entries(),
+        prove_ov_hdr_payload.get_unverified_value().num_ov_entries(),
     )
     .await
     .context("Error getting OV entries")?;
 
     let ownership_voucher = {
         let header = prove_ov_hdr_payload.get_unverified_value().ov_header();
-        OwnershipVoucher::from_parts(
-            ProtocolVersion::Version2_0,
-            header,
-            header_hmac,
-            ov_entries,
-        )
+        OwnershipVoucher::from_parts(ProtocolVersion::Version2_0, header, header_hmac, ov_entries)
     }
     .context("Error reconstructing Ownership Voucher")?;
 
@@ -570,8 +547,6 @@ async fn perform_to2(
     // Otherwise, use the OV owner's key directly.
     #[cfg(feature = "delegate_support")]
     let delegate_pkey: Option<openssl::pkey::PKey<openssl::pkey::Public>> = {
-        use fdo_data_formats::constants::HeaderKeys;
-
         // Check if header 258 exists (already confirmed above)
         let has_delegate = prove_ov_hdr
             .get_unprotected_raw()
@@ -579,12 +554,17 @@ async fn perform_to2(
 
         if has_delegate {
             // Parse raw bytes manually since PublicKey Deserialize can't handle Go's X5Chain encoding
-            let cose_bytes = prove_ov_hdr.serialize_data()
+            let cose_bytes = prove_ov_hdr
+                .serialize_data()
                 .context("Error serializing COSE for delegate extraction")?;
-            use fdo_data_formats::cborparser::{ParsedArray, ParsedArraySize3, ParsedArraySize4, ParsedArraySizeDynamic};
-            let cose_arr: ParsedArray<ParsedArraySize4> = ParsedArray::deserialize_data(&cose_bytes)?;
+            use fdo_data_formats::cborparser::{
+                ParsedArray, ParsedArraySize3, ParsedArraySize4, ParsedArraySizeDynamic,
+            };
+            let cose_arr: ParsedArray<ParsedArraySize4> =
+                ParsedArray::deserialize_data(&cose_bytes)?;
             let map_bytes = cose_arr.get_raw(1);
-            let map_items: ParsedArray<ParsedArraySizeDynamic> = ParsedArray::deserialize_data(map_bytes)?;
+            let map_items: ParsedArray<ParsedArraySizeDynamic> =
+                ParsedArray::deserialize_data(map_bytes)?;
 
             let mut result = None;
             let num_items = map_items.len();
@@ -593,18 +573,26 @@ async fn perform_to2(
                 if let Ok(ki) = serde_cbor::from_slice::<i64>(kb) {
                     if ki == 258 && idx + 1 < num_items {
                         let pk_bytes = map_items.get_raw(idx + 1);
-                        let pk_arr: ParsedArray<ParsedArraySize3> = ParsedArray::deserialize_data(pk_bytes)?;
+                        let pk_arr: ParsedArray<ParsedArraySize3> =
+                            ParsedArray::deserialize_data(pk_bytes)?;
                         let body_bytes = pk_arr.get_raw(2);
-                        let cert_ders: Vec<serde_bytes::ByteBuf> = serde_cbor::from_slice(body_bytes)?;
+                        let cert_ders: Vec<serde_bytes::ByteBuf> =
+                            serde_cbor::from_slice(body_bytes)?;
                         if let Some(leaf_der) = cert_ders.first() {
                             let leaf_cert = openssl::x509::X509::from_der(leaf_der)?;
                             result = Some(leaf_cert.public_key()?);
-                            log::info!("Delegate chain found ({} certs), using leaf cert key", cert_ders.len());
+                            log::info!(
+                                "Delegate chain found ({} certs), using leaf cert key",
+                                cert_ders.len()
+                            );
 
                             // Validate root against OV owner
                             if let Some(root_der) = cert_ders.last() {
                                 let root_cert = openssl::x509::X509::from_der(root_der)?;
-                                if root_cert.verify(ov_owner_entry.public_key().pkey()).unwrap_or(false) {
+                                if root_cert
+                                    .verify(ov_owner_entry.public_key().pkey())
+                                    .unwrap_or(false)
+                                {
                                     log::info!("Delegate chain root verified against OV owner");
                                 } else {
                                     log::warn!("Delegate chain root NOT signed by OV owner");
@@ -617,7 +605,11 @@ async fn perform_to2(
                                 let parent = openssl::x509::X509::from_der(&cert_ders[ci + 1])?;
                                 let parent_key = parent.public_key()?;
                                 if !child.verify(&parent_key).unwrap_or(false) {
-                                    log::warn!("Delegate chain: cert {} not signed by cert {}", ci, ci+1);
+                                    log::warn!(
+                                        "Delegate chain: cert {} not signed by cert {}",
+                                        ci,
+                                        ci + 1
+                                    );
                                 }
                             }
                         }
@@ -655,9 +647,7 @@ async fn perform_to2(
     //         In FDO 2.0: device sent xA in ProveDevice20,
     //         server sent xB in ProveOVHdr20. Derive session keys.
     // -------------------------------------------------------
-    let non_interoperable_kdf_required = client
-        .non_interoperable_kdf_required()
-        .unwrap_or(false);
+    let non_interoperable_kdf_required = client.non_interoperable_kdf_required().unwrap_or(false);
 
     let xb_key_exchange = _prove_ov_hdr_payload.xb_key_exchange();
     let new_keys = a_key_exchange
@@ -704,8 +694,7 @@ async fn perform_to2(
     // -------------------------------------------------------
 
     // Mark onboarding performed
-    mark_device_onboarding_executed()
-        .context("Error creating device onboarding marker file")?;
+    mark_device_onboarding_executed().context("Error creating device onboarding marker file")?;
 
     // Deactivate credential
     devcredloc
@@ -769,8 +758,6 @@ async fn main() -> Result<()> {
             "Device Onboarding marker file {:?} exists, not rerunning FDO onboarding",
             marker_file
         );
-        reencrypt::perform_required_reencrypts()
-            .context("Error performing required re-encrypts")?;
         return Ok(());
     }
 

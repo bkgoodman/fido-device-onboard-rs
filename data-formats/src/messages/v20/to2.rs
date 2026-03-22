@@ -11,7 +11,6 @@
 //       OwnerSvcInfo20(89) -> Done20(90) -> DoneAck20(91)
 
 use serde::Deserialize;
-use serde_bytes::ByteBuf;
 use serde_tuple::Serialize_tuple;
 
 use crate::simple_message_serializable;
@@ -20,10 +19,9 @@ use crate::{
     messages::{ClientMessage, EncryptionRequirement, Message, ServerMessage},
     ownershipvoucher::OwnershipVoucherEntry,
     types::{
-        COSESign, CapabilityFlags, CipherSuite, Guid, HMac, Hash, KexSuite, Nonce,
-        RendezvousInfo, ServiceInfo,
+        COSESign, CapabilityFlags, CipherSuite, Guid, HMac, Hash, KexSuite, Nonce, RendezvousInfo,
+        ServiceInfo,
     },
-    Serializable,
 };
 
 pub(crate) const MAX_MESSAGE_SIZE: u16 = u16::MAX;
@@ -424,7 +422,7 @@ impl crate::Serializable for SetupDevice20 {
         Self::deserialize_from_reader(data)
     }
 
-    fn serialize_to_writer<W>(&self, mut writer: W) -> Result<(), crate::Error>
+    fn serialize_to_writer<W>(&self, writer: W) -> Result<(), crate::Error>
     where
         W: std::io::Write,
     {

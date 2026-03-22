@@ -9,6 +9,26 @@
 > adding full FDO 2.0 client-side protocol support while stripping out the
 > server components that are no longer needed.
 
+## Why a Rust FDO client?
+
+This project exists for environments where a full Go runtime is not available
+or practical, and where the device has no operating system yet:
+
+- **Device firmware and BIOS** -- UEFI DXE drivers or PEI modules that need
+  to onboard before any OS is loaded.
+- **OS installers and provisioning agents** -- minimal environments whose
+  whole purpose is to install an operating system. They need FDO to receive
+  boot images and configuration, not to manage an already-running system.
+- **Embedded and constrained devices** -- resource-limited hardware where
+  a statically linked Rust binary is far smaller than a Go runtime.
+
+Because these environments have no running OS, the only Service Info Modules
+(FSIMs) that matter are `devmod` (required by the protocol) and `fdo.bmo`
+(Bare Metal Onboarding -- delivering boot images, BIOS parameters, and
+Secure Boot keys to the device). The upstream FSIMs that assume a running
+Linux system (SSH key injection, arbitrary file writes, shell commands,
+LUKS disk encryption, RHEL subscription management) are being removed.
+
 ## Getting started -- interop test script
 
 The fastest way to see this code in action is the interop test script. It
@@ -97,6 +117,35 @@ The server-side crates (`rendezvous-server`, `manufacturing-server`,
 `owner-onboarding-server`, `serviceinfo-api-server`, `admin-tool`,
 `owner-tool`) and FDO 1.x message modules are being removed. See
 `FDO_2.0_MIGRATION_PLAN.md` for the full status.
+
+### Integrating with your platform -- the BMO callback model
+
+Everything in this codebase except the BMO handler is **protocol plumbing**
+that should run as-is on any platform: DI, TO1, TO2, CBOR serialization,
+COSE signatures, key exchange, encryption. A real-world integration should
+not need to modify any of that.
+
+**The only integration point is BMO.** When the owner server delivers data
+during onboarding, the BMO handler in `client-linuxapp/src/serviceinfo.rs`
+receives it and must do something platform-specific with it. This is where
+your implementation hooks in:
+
+| BMO event | What the handler receives | What your platform does |
+| --------- | ------------------------ | ----------------------- |
+| **Inline image** | Image bytes + metadata (type, name, hash) | Write to flash, chainload EFI binary, stage for OS installer |
+| **URL delivery** | URL string + metadata (type, hash, TLS CA) | Fetch image from URL (HTTP/HTTPS), verify hash, apply |
+| **Meta-URL delivery** | Meta-URL + COSE signer key | Fetch signed meta-payload, verify signature, resolve actual image URL, fetch and apply |
+| **BIOS parameters** | Key-value pairs (e.g. `secure-boot=true`) | Write UEFI variables, update BIOS/firmware settings |
+| **Secure Boot certs** | DER certificate bytes (type `application/x-uefi-db-cert`) | Enroll into UEFI Secure Boot DB/DBX |
+
+The reference implementation writes everything to files under `BMO_OUTPUT_DIR`
+(default `/tmp/fdo-bmo`). To integrate with a real platform, replace the
+file-write calls in the BMO handler with your platform-specific operations.
+The protocol machinery delivers the data; your code decides what to do with it.
+
+This design means a firmware or installer team can take this codebase, leave
+the FDO protocol stack untouched, and only implement the BMO callback layer
+for their specific hardware.
 
 ---
 

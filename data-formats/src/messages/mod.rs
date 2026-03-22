@@ -10,7 +10,7 @@ use crate::{
 };
 
 pub mod v11;
-pub mod v20;  // FDO 2.0 messages
+pub mod v20; // FDO 2.0 messages
 
 pub trait ClientMessage: Message {}
 pub trait ServerMessage: Message {}

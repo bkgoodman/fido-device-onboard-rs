@@ -5,9 +5,7 @@
 use std::ops::Range;
 
 use openssl::pkey::{PKeyRef, Private};
-use serde::Deserialize;
 use serde_bytes::ByteBuf;
-use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::{
     cborparser::{
@@ -389,7 +387,8 @@ impl EntryIter<'_> {
         entry: OwnershipVoucherEntry,
     ) -> Result<OwnershipVoucherEntryPayload> {
         let entry_cose = entry.0;
-        let entry: OwnershipVoucherEntryPayload = entry_cose.get_payload(self.last_pubkey.pkey())?;
+        let entry: OwnershipVoucherEntryPayload =
+            entry_cose.get_payload(self.last_pubkey.pkey())?;
 
         // Compare the HashPreviousEntry to either (HeaderTag || HeaderHmac) or the previous entry
         let hash_previous_entry = if self.index == 0 {
@@ -686,7 +685,7 @@ impl crate::Serializable for OwnershipVoucherEntryPayload {
         Self::deserialize_from_reader(data)
     }
 
-    fn serialize_to_writer<W>(&self, mut writer: W) -> Result<()>
+    fn serialize_to_writer<W>(&self, writer: W) -> Result<()>
     where
         W: std::io::Write,
     {
@@ -723,7 +722,7 @@ impl OwnershipVoucherEntryPayload {
         &self.hash_header_info
     }
 
-    pub fn extra(&self) -> RefExtraType {
+    pub fn extra(&self) -> RefExtraType<'_> {
         self.extra.as_ref()
     }
 
@@ -744,17 +743,15 @@ mod tests_ov_entry {
         let payload_bytes: Vec<u8> = vec![
             0x84, // array(4)
             0x82, 0x2f, 0x58, 0x20, // Hash: [Sha256(-16), bytes(32)]
-            0x6f, 0x2b, 0x1e, 0x1c, 0x8f, 0x8c, 0x26, 0x63, 0x5e, 0xf7, 0x32, 0xff,
-            0x60, 0x80, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x82, 0x2f, 0x58, 0x20, // Hash: [Sha256(-16), bytes(32)]
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x41, 0xa0, // extra: bytes(1) 0xa0  OR  empty map
+            0x6f, 0x2b, 0x1e, 0x1c, 0x8f, 0x8c, 0x26, 0x63, 0x5e, 0xf7, 0x32, 0xff, 0x60, 0x80,
+            0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x82, 0x2f, 0x58, 0x20, // Hash: [Sha256(-16), bytes(32)]
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x41, 0xa0, // extra: bytes(1) 0xa0  OR  empty map
             0x83, 0x0a, 0x01, 0x41, 0x00, // PublicKey: [10, 1, bytes(1)]
         ];
-        
+
         // Try to deserialize with custom Serializable (uses ParsedArray)
         let result = OwnershipVoucherEntryPayload::deserialize_data(&payload_bytes);
         match result {
@@ -774,7 +771,8 @@ mod tests_ov_entry {
             .expect("Failed to deserialize OV entry from Go server bytes");
 
         // Step 2: Re-serialize
-        let reserialized = entry.serialize_data()
+        let reserialized = entry
+            .serialize_data()
             .expect("Failed to re-serialize OV entry");
 
         // Step 3: Deserialize again (round-trip)

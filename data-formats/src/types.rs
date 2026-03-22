@@ -20,9 +20,8 @@ use serde_tuple::Serialize_tuple;
 use crate::{
     cborparser::{ParsedArray, ParsedArrayBuilder},
     constants::{
-        DeviceSigType, HashType, HeaderKeys, PublicKeyEncoding, PublicKeyType,
-        RendezvousVariable, ServiceInfoModule,
-        StandardServiceInfoModule, TransportProtocol, EAT_UEID_CLAIM_KEY,
+        DeviceSigType, HashType, HeaderKeys, PublicKeyEncoding, PublicKeyType, RendezvousVariable,
+        ServiceInfoModule, StandardServiceInfoModule, TransportProtocol, EAT_UEID_CLAIM_KEY,
     },
     errors::Error,
     ownershipvoucher::OwnershipVoucher,
@@ -64,21 +63,43 @@ impl<'de> serde::Deserialize<'de> for Hash {
             fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
                 f.write_str("Hash as array or map")
             }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut s: A) -> core::result::Result<Hash, A::Error> {
-                let ht = s.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                let v: serde_bytes::ByteBuf = s.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
-                Ok(Hash { hash_type: ht, value: v.into_vec() })
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut s: A,
+            ) -> core::result::Result<Hash, A::Error> {
+                let ht = s
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let v: serde_bytes::ByteBuf = s
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                Ok(Hash {
+                    hash_type: ht,
+                    value: v.into_vec(),
+                })
             }
-            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut m: A) -> core::result::Result<Hash, A::Error> {
-                let mut ht = None; let mut v = None;
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut m: A,
+            ) -> core::result::Result<Hash, A::Error> {
+                let mut ht = None;
+                let mut v = None;
                 while let Some(k) = m.next_key::<String>()? {
                     match k.as_str() {
                         "hash_type" => ht = Some(m.next_value()?),
-                        "value" => { let b: serde_bytes::ByteBuf = m.next_value()?; v = Some(b.into_vec()); }
-                        _ => { let _: serde::de::IgnoredAny = m.next_value()?; }
+                        "value" => {
+                            let b: serde_bytes::ByteBuf = m.next_value()?;
+                            v = Some(b.into_vec());
+                        }
+                        _ => {
+                            let _: serde::de::IgnoredAny = m.next_value()?;
+                        }
                     }
                 }
-                Ok(Hash { hash_type: ht.ok_or_else(|| serde::de::Error::missing_field("hash_type"))?, value: v.ok_or_else(|| serde::de::Error::missing_field("value"))? })
+                Ok(Hash {
+                    hash_type: ht.ok_or_else(|| serde::de::Error::missing_field("hash_type"))?,
+                    value: v.ok_or_else(|| serde::de::Error::missing_field("value"))?,
+                })
             }
         }
         deserializer.deserialize_any(V)
@@ -296,7 +317,13 @@ impl<'de> serde::Deserialize<'de> for CapabilityFlags {
                 let vendor_unique: Option<Vec<String>> = seq.next_element()?;
                 Ok(CapabilityFlags {
                     flags: flags.into_vec(),
-                    vendor_unique: vendor_unique.and_then(|v| if v.is_empty() { None } else { Some(v) }),
+                    vendor_unique: vendor_unique.and_then(|v| {
+                        if v.is_empty() {
+                            None
+                        } else {
+                            Some(v)
+                        }
+                    }),
                 })
             }
         }
@@ -1118,7 +1145,7 @@ impl ServiceInfo {
         self.add(StandardServiceInfoModule::DevMod, "modules", &list)
     }
 
-    pub fn iter(&self) -> ServiceInfoIter {
+    pub fn iter(&self) -> ServiceInfoIter<'_> {
         ServiceInfoIter { info: self, pos: 0 }
     }
 
@@ -2064,8 +2091,7 @@ impl COSEHeaderMap {
     where
         T: Serialize,
     {
-        self.0
-            .insert(key, serde_cbor::value::to_value(value)?);
+        self.0.insert(key, serde_cbor::value::to_value(value)?);
         Ok(())
     }
 
@@ -2230,7 +2256,12 @@ impl COSESign {
         let hm = self.cached_inner.get_unprotected();
         let has_257 = hm.get(&serde_cbor::Value::Integer(257)).is_some();
         let has_258 = hm.get(&serde_cbor::Value::Integer(258)).is_some();
-        format!("empty={}, has_owner_key(257)={}, has_delegate(258)={}", hm.is_empty(), has_257, has_258)
+        format!(
+            "empty={}, has_owner_key(257)={}, has_delegate(258)={}",
+            hm.is_empty(),
+            has_257,
+            has_258
+        )
     }
 
     pub fn get_payload<T>(&self, key: &dyn SigningPublicKey) -> Result<T, Error>
@@ -2319,8 +2350,7 @@ impl COSESign {
 
         // Parse the unprotected header map as a ParsedArray (now supports maps).
         // Map items are stored as alternating key-value pairs.
-        let items: ParsedArray<ParsedArraySizeDynamic> =
-            ParsedArray::deserialize_data(map_bytes)?;
+        let items: ParsedArray<ParsedArraySizeDynamic> = ParsedArray::deserialize_data(map_bytes)?;
 
         let target = key as i64;
         let num_items = items.len();
@@ -2330,7 +2360,11 @@ impl COSESign {
                 if ki == target && i + 1 < num_items {
                     // Found! The value is at position i+1, as raw CBOR bytes
                     let val_bytes = items.get_raw(i + 1);
-                    log::warn!("Delegate raw value bytes ({} bytes, first 10): {:02x?}", val_bytes.len(), &val_bytes[..std::cmp::min(10, val_bytes.len())]);
+                    log::warn!(
+                        "Delegate raw value bytes ({} bytes, first 10): {:02x?}",
+                        val_bytes.len(),
+                        &val_bytes[..std::cmp::min(10, val_bytes.len())]
+                    );
                     return Ok(Some(T::deserialize_data(val_bytes)?));
                 }
             }

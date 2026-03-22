@@ -14,10 +14,7 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 
 mod serviceinfo_names;
 
-pub use serviceinfo_names::{
-    FdoServiceInfoModule, FedoraIotServiceInfoModule, RedHatComServiceInfoModule,
-    ServiceInfoModule, StandardServiceInfoModule,
-};
+pub use serviceinfo_names::{FdoServiceInfoModule, ServiceInfoModule, StandardServiceInfoModule};
 
 #[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr, PartialEq, Eq, PartialOrd)]
 #[repr(u16)]

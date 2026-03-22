@@ -98,9 +98,15 @@ impl<'de> serde::Deserialize<'de> for HelloRVAck {
             where
                 A: serde::de::SeqAccess<'de>,
             {
-                let nonce4 = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                let b_signature_info = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
-                let flags: serde_bytes::ByteBuf = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                let nonce4 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let b_signature_info = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let flags: serde_bytes::ByteBuf = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
                 let vendor_unique: Option<Vec<String>> = seq.next_element()?;
                 Ok(HelloRVAck {
                     nonce4,

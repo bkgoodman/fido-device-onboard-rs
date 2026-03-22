@@ -11,7 +11,9 @@ use std::{convert::TryFrom, fs};
 use std::{convert::TryInto, env, str::FromStr};
 
 use fdo_data_formats::{
-    constants::{HashType, HeaderKeys, KeyStorageType, MfgStringType, PublicKeyEncoding, PublicKeyType},
+    constants::{
+        HashType, HeaderKeys, KeyStorageType, MfgStringType, PublicKeyEncoding, PublicKeyType,
+    },
     devicecredential::{file::KeyStorage, FileDeviceCredential},
     enhanced_types::X5Bag,
     messages,
@@ -235,14 +237,10 @@ async fn perform_di(
     let mfg_info = get_mfg_info(mfg_string_type, iface)
         .await
         .context("Error building MFG string")?;
-    
+
     match protocol_version {
-        ProtocolVersion::Version2_0 => {
-            perform_di_v20(client, key_reference, mfg_info).await
-        }
-        _ => {
-            perform_di_v11(client, key_reference, mfg_info).await
-        }
+        ProtocolVersion::Version2_0 => perform_di_v20(client, key_reference, mfg_info).await,
+        _ => perform_di_v11(client, key_reference, mfg_info).await,
     }
 }
 
@@ -292,11 +290,13 @@ async fn perform_di_v20(
     use fdo_data_formats::types::CapabilityFlags;
 
     // Determine key type from the signing key
-    let key_type = key_reference.get_public_key_type()
+    let key_type = key_reference
+        .get_public_key_type()
         .context("Error determining public key type")?;
 
     // Generate a CSR using the device's signing key
-    let csr_der = key_reference.generate_csr()
+    let csr_der = key_reference
+        .generate_csr()
         .context("Error generating CSR for DeviceMfgInfo")?;
 
     // Extract serial number and device info from mfg_info
@@ -317,9 +317,8 @@ async fn perform_di_v20(
     let capability_flags = CapabilityFlags::new_v20_client();
     let app_start = messages::v20::di::AppStart::new(&device_mfg_info, capability_flags);
 
-    let set_credentials: RequestResult<messages::v20::di::SetCredentials> = client
-        .send_request(app_start, None)
-        .await;
+    let set_credentials: RequestResult<messages::v20::di::SetCredentials> =
+        client.send_request(app_start, None).await;
     let set_credentials = set_credentials.context("Error sending AppStart")?;
 
     let ov_header = set_credentials.into_ov_header();
@@ -448,13 +447,16 @@ async fn main() -> Result<()> {
                 keyref = KeyReference::str_key(args.key_ref)
                     .await
                     .context("Error determining key for DI")?;
-                
+
                 // Convert fdo_version to ProtocolVersion
                 let protocol_version = match args.fdo_version {
                     101 => ProtocolVersion::Version1_0,
                     110 => ProtocolVersion::Version1_1,
                     200 => ProtocolVersion::Version2_0,
-                    _ => bail!("Invalid FDO version: {}. Valid values are 101, 110, or 200", args.fdo_version),
+                    _ => bail!(
+                        "Invalid FDO version: {}. Valid values are 101, 110, or 200",
+                        args.fdo_version
+                    ),
                 };
                 client = ServiceClient::new(protocol_version, &url);
                 protocol_ver = protocol_version;
@@ -462,11 +464,10 @@ async fn main() -> Result<()> {
             Commands::NoPlainDI(args) => {
                 url = args.manufacturing_server_url;
 
-                if args.rootcerts.is_some() {
-                    let bag = get_X5Bag_from_rootcerts_path(args.rootcerts.unwrap())?;
+                if let Some(rootcerts) = args.rootcerts {
+                    let bag = get_X5Bag_from_rootcerts_path(rootcerts)?;
                     diun_pub_key_verification = DiunPublicKeyVerificationMode::Certs(bag);
-                } else if args.hash.is_some() {
-                    let input_hash = args.hash.unwrap();
+                } else if let Some(input_hash) = args.hash {
                     let hash = Hash::from_str(&input_hash)
                         .context(format!("Error parsing '{input_hash}' as hash"))?;
                     diun_pub_key_verification = DiunPublicKeyVerificationMode::Hash(hash);
@@ -477,17 +478,20 @@ async fn main() -> Result<()> {
                 }
 
                 log::debug!("Performing DIUN");
-                
+
                 // Convert fdo_version to ProtocolVersion
                 let protocol_version = match args.fdo_version {
                     101 => ProtocolVersion::Version1_0,
                     110 => ProtocolVersion::Version1_1,
                     200 => ProtocolVersion::Version2_0,
-                    _ => bail!("Invalid FDO version: {}. Valid values are 101, 110, or 200", args.fdo_version),
+                    _ => bail!(
+                        "Invalid FDO version: {}. Valid values are 101, 110, or 200",
+                        args.fdo_version
+                    ),
                 };
                 client = ServiceClient::new(protocol_version, &url);
                 protocol_ver = protocol_version;
-                
+
                 (keyref, mfg_string_type) = perform_diun(&mut client, diun_pub_key_verification)
                     .await
                     .context("Error performing DIUN")?;
@@ -518,7 +522,7 @@ async fn main() -> Result<()> {
 
         url = env::var("MANUFACTURING_SERVER_URL")
             .context("Please provide MANUFACTURING_SERVER_URL")?;
-        
+
         // Parse FDO version from environment (defaults to 1.1)
         let fdo_version: u32 = env::var("FDO_VERSION")
             .ok()
@@ -528,7 +532,10 @@ async fn main() -> Result<()> {
             101 => ProtocolVersion::Version1_0,
             110 => ProtocolVersion::Version1_1,
             200 => ProtocolVersion::Version2_0,
-            _ => bail!("Invalid FDO_VERSION: {}. Valid values are 101, 110, or 200", fdo_version),
+            _ => bail!(
+                "Invalid FDO_VERSION: {}. Valid values are 101, 110, or 200",
+                fdo_version
+            ),
         };
         client = ServiceClient::new(protocol_ver, &url);
 
@@ -972,25 +979,21 @@ impl KeyReference {
     /// Determine the FDO PublicKeyType from the signing key.
     fn get_public_key_type(&self) -> Result<PublicKeyType> {
         match self {
-            KeyReference::FileSystem { sign_key, .. } => {
-                match sign_key.id() {
-                    openssl::pkey::Id::EC => {
-                        let ec = sign_key.ec_key().context("Error getting EC key")?;
-                        match ec.group().curve_name() {
-                            Some(Nid::X9_62_PRIME256V1) => Ok(PublicKeyType::SECP256R1),
-                            Some(Nid::SECP384R1) => Ok(PublicKeyType::SECP384R1),
-                            _ => bail!("Unsupported EC curve"),
-                        }
+            KeyReference::FileSystem { sign_key, .. } => match sign_key.id() {
+                openssl::pkey::Id::EC => {
+                    let ec = sign_key.ec_key().context("Error getting EC key")?;
+                    match ec.group().curve_name() {
+                        Some(Nid::X9_62_PRIME256V1) => Ok(PublicKeyType::SECP256R1),
+                        Some(Nid::SECP384R1) => Ok(PublicKeyType::SECP384R1),
+                        _ => bail!("Unsupported EC curve"),
                     }
-                    openssl::pkey::Id::RSA => {
-                        match sign_key.bits() {
-                            2048 => Ok(PublicKeyType::Rsa2048RESTR),
-                            _ => Ok(PublicKeyType::RsaPkcs),
-                        }
-                    }
-                    _ => bail!("Unsupported key type"),
                 }
-            }
+                openssl::pkey::Id::RSA => match sign_key.bits() {
+                    2048 => Ok(PublicKeyType::Rsa2048RESTR),
+                    _ => Ok(PublicKeyType::RsaPkcs),
+                },
+                _ => bail!("Unsupported key type"),
+            },
             KeyReference::SemiTpm { .. } => {
                 // TPM keys are always SECP384R1 in this implementation
                 Ok(PublicKeyType::SECP384R1)
@@ -1005,30 +1008,38 @@ impl KeyReference {
     fn generate_csr(&self) -> Result<Vec<u8>> {
         match self {
             KeyReference::FileSystem { sign_key, .. } => {
-                let mut name_builder = X509NameBuilder::new()
-                    .context("Error creating X509 name builder")?;
-                name_builder.append_entry_by_text("CN", "device.fdo-rs")
+                let mut name_builder =
+                    X509NameBuilder::new().context("Error creating X509 name builder")?;
+                name_builder
+                    .append_entry_by_text("CN", "device.fdo-rs")
                     .context("Error setting CSR subject CN")?;
                 let name = name_builder.build();
 
-                let mut req_builder = X509ReqBuilder::new()
-                    .context("Error creating X509 request builder")?;
-                req_builder.set_subject_name(&name)
+                let mut req_builder =
+                    X509ReqBuilder::new().context("Error creating X509 request builder")?;
+                req_builder
+                    .set_subject_name(&name)
                     .context("Error setting CSR subject name")?;
-                req_builder.set_pubkey(sign_key)
+                req_builder
+                    .set_pubkey(sign_key)
                     .context("Error setting CSR public key")?;
 
                 // Choose digest based on key type
                 let digest = match sign_key.id() {
                     openssl::pkey::Id::EC => {
                         let bits = sign_key.bits();
-                        if bits <= 256 { MessageDigest::sha256() } else { MessageDigest::sha384() }
+                        if bits <= 256 {
+                            MessageDigest::sha256()
+                        } else {
+                            MessageDigest::sha384()
+                        }
                     }
                     openssl::pkey::Id::RSA => MessageDigest::sha384(),
                     _ => MessageDigest::sha256(),
                 };
 
-                req_builder.sign(sign_key, digest)
+                req_builder
+                    .sign(sign_key, digest)
                     .context("Error signing CSR")?;
                 let req = req_builder.build();
                 req.to_der().context("Error converting CSR to DER")

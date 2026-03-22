@@ -267,46 +267,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bindgen"
-version = "0.68.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "726e4313eb6ec35d2730258ad4e15b547ee75d6afaa1361a922e78e59b7d8078"
-dependencies = [
- "bitflags 2.5.0",
- "cexpr",
- "clang-sys",
- "lazy_static",
- "lazycell",
- "peeking_take_while",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash",
- "shlex",
- "syn 2.0.89",
-]
-
-[[package]]
-name = "bindgen"
-version = "0.69.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "271383c67ccabffb7381723dea0672a673f292304fcb45c01cc648c7a8d58088"
-dependencies = [
- "bitflags 2.5.0",
- "cexpr",
- "clang-sys",
- "itertools",
- "lazy_static",
- "lazycell",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash",
- "shlex",
- "syn 2.0.89",
-]
-
-[[package]]
 name = "bitfield"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -801,33 +761,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6e854126756c496b8c81dec88f9a706b15b875c5849d4097a3854476b9fdf94"
 
 [[package]]
-name = "devicemapper"
-version = "0.34.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3478a500c4cc8ab8ed3e81f9595ab79fe075ec7eb421ed04df8d7acb13905d3"
-dependencies = [
- "bitflags 2.5.0",
- "devicemapper-sys",
- "env_logger",
- "lazy_static",
- "log",
- "nix 0.27.1",
- "rand",
- "retry",
- "semver",
- "serde",
-]
-
-[[package]]
-name = "devicemapper-sys"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "734fba4d2e6b551396439ea7dd4f56980b11bb096bbf505d4a259943b228367b"
-dependencies = [
- "bindgen 0.68.1",
-]
-
-[[package]]
 name = "diesel"
 version = "2.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1015,7 +948,7 @@ dependencies = [
  "fdo-util",
  "futures",
  "log",
- "nix 0.31.2",
+ "nix",
  "openssl",
  "pretty_env_logger",
  "rand",
@@ -1031,16 +964,13 @@ name = "fdo-client-linuxapp"
 version = "0.5.5"
 dependencies = [
  "anyhow",
- "devicemapper",
  "fdo-data-formats",
  "fdo-http-wrapper",
  "fdo-util",
- "libcryptsetup-rs",
  "log",
- "nix 0.31.2",
  "openssl",
  "rand",
- "secrecy",
+ "reqwest",
  "serde_bytes",
  "serde_cbor",
  "sys-info",
@@ -1933,15 +1863,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1984,36 +1905,6 @@ name = "libc"
 version = "0.2.183"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
-
-[[package]]
-name = "libcryptsetup-rs"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "186b5b6114517ab1d6e25741c6fb21060aae750e70868842efc9dd1efd08baa1"
-dependencies = [
- "bitflags 2.5.0",
- "either",
- "libc",
- "libcryptsetup-rs-sys",
- "log",
- "once_cell",
- "pkg-config",
- "semver",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "libcryptsetup-rs-sys"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c78b397341cb9aa5ddc8d11118754ed0eab4aeb9cee96ee7cbe83a7d2867b8d2"
-dependencies = [
- "bindgen 0.69.5",
- "cc",
- "pkg-config",
- "semver",
-]
 
 [[package]]
 name = "libloading"
@@ -2170,17 +2061,6 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "tempfile",
-]
-
-[[package]]
-name = "nix"
-version = "0.27.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2eb04e9c688eff1c89d72b407f168cf79bb9e867a9d3323ed6c01519eb9cc053"
-dependencies = [
- "bitflags 2.5.0",
- "cfg-if 1.0.0",
- "libc",
 ]
 
 [[package]]
@@ -2765,12 +2645,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "retry"
-version = "1.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac95c60a949a63fd2822f4964939662d8f2c16c4fa0624fd954bc6e703b9a3f6"
-
-[[package]]
 name = "ring"
 version = "0.17.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2916,15 +2790,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
-name = "secrecy"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bd1c54ea06cfd2f6b63219704de0b9b4f72dcc2b8fdef820be6cd799780e91e"
-dependencies = [
- "zeroize",
-]
-
-[[package]]
 name = "security-framework"
 version = "2.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2946,12 +2811,6 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
-
-[[package]]
-name = "semver"
-version = "1.0.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92d43fe69e652f3df9bdc2b85b2854a0825b86e4fb76bc44d945137d053639ca"
 
 [[package]]
 name = "serde"
@@ -3577,7 +3436,7 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "535cd192581c2ec4d5f82e670b1d3fbba6a23ccce8c85de387642051d7cad5b5"
 dependencies = [
- "bindgen 0.66.1",
+ "bindgen",
  "pkg-config",
  "target-lexicon",
 ]

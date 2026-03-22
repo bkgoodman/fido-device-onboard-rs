@@ -13,7 +13,6 @@ use crate::{
     messages::{ClientMessage, EncryptionRequirement, Message, ServerMessage},
     ownershipvoucher::OwnershipVoucherHeader,
     types::{CapabilityFlags, DeviceMfgInfo, HMac},
-    Error,
 };
 
 // Type 10: DI.AppStart - FDO 2.0
@@ -32,8 +31,7 @@ impl AppStart {
     /// matching Go's cbor.Bstr[custom.DeviceMfgInfo] encoding.
     pub fn new(info: &DeviceMfgInfo, capability_flags: CapabilityFlags) -> Self {
         let mut buffer = Vec::new();
-        ciborium::ser::into_writer(info, &mut buffer)
-            .expect("Failed to serialize DeviceMfgInfo");
+        ciborium::ser::into_writer(info, &mut buffer).expect("Failed to serialize DeviceMfgInfo");
         AppStart {
             info: Some(ByteBuf::from(buffer)),
             capability_flags,
@@ -90,8 +88,7 @@ impl crate::Serializable for SetCredentials {
         R: std::io::Read,
     {
         // Go sends array(1): [Bstr(OVHeader)]
-        let (ov_header_bytes,): (serde_bytes::ByteBuf,) =
-            ciborium::de::from_reader(&mut reader)?;
+        let (ov_header_bytes,): (serde_bytes::ByteBuf,) = ciborium::de::from_reader(&mut reader)?;
         let ov_header = OwnershipVoucherHeader::deserialize_from_reader(&ov_header_bytes[..])?;
         Ok(SetCredentials { ov_header })
     }
@@ -208,8 +205,8 @@ impl ServerMessage for Done {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{PublicKeyEncoding, PublicKeyType};
     use crate::Serializable;
-    use crate::constants::{PublicKeyType, PublicKeyEncoding};
 
     #[test]
     fn test_capability_flags_in_app_start() {
@@ -245,7 +242,10 @@ mod tests {
         );
         let serialized = info.serialize_data().unwrap();
         // First byte 0x85 = CBOR array(5)
-        assert_eq!(serialized[0], 0x85, "DeviceMfgInfo must serialize as CBOR array(5)");
+        assert_eq!(
+            serialized[0], 0x85,
+            "DeviceMfgInfo must serialize as CBOR array(5)"
+        );
     }
 
     #[test]
@@ -265,15 +265,23 @@ mod tests {
         println!("AppStart hex: {}", hex::encode(&serialized));
 
         // First byte 0x82 = CBOR array(2)
-        assert_eq!(serialized[0], 0x82, "AppStart must serialize as CBOR array(2)");
+        assert_eq!(
+            serialized[0], 0x82,
+            "AppStart must serialize as CBOR array(2)"
+        );
 
         // Second byte must be a CBOR bstr (major type 2 = 0x40..0x5b)
         let major_type = serialized[1] >> 5;
-        assert_eq!(major_type, 2, "First element must be a CBOR byte string (bstr)");
+        assert_eq!(
+            major_type, 2,
+            "First element must be a CBOR byte string (bstr)"
+        );
 
         // Roundtrip: deserialize and check structure
         let deserialized = AppStart::deserialize_from_reader(&serialized[..]).unwrap();
-        assert!(deserialized.capability_flags().supports_version(ProtocolVersion::Version2_0));
+        assert!(deserialized
+            .capability_flags()
+            .supports_version(ProtocolVersion::Version2_0));
     }
 
     #[test]

@@ -37,8 +37,6 @@ impl serde::Serialize for ServiceInfoModule {
 #[non_exhaustive]
 pub enum ServiceInfoModule {
     Standard(StandardServiceInfoModule),
-    FedoraIot(FedoraIotServiceInfoModule),
-    RedHatCom(RedHatComServiceInfoModule),
     Fdo(FdoServiceInfoModule),
     Unsupported(String),
 }
@@ -48,22 +46,8 @@ impl FromStr for ServiceInfoModule {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
-            "org.fedoraiot.binaryfile" => FedoraIotServiceInfoModule::BinaryFile.into(),
-            "org.fedoraiot.command" => FedoraIotServiceInfoModule::Command.into(),
-            "org.fedoraiot.sshkey" => FedoraIotServiceInfoModule::SSHKey.into(),
-            "org.fedoraiot.diskencryption-clevis" => {
-                FedoraIotServiceInfoModule::DiskEncryptionClevis.into()
-            }
-            "org.fedoraiot.reboot" => FedoraIotServiceInfoModule::Reboot.into(),
-
-            "com.redhat.subscriptionmanager" => {
-                RedHatComServiceInfoModule::SubscriptionManager.into()
-            }
-
-            "fdo.bmo" => FdoServiceInfoModule::Bmo.into(),
-
             "devmod" => StandardServiceInfoModule::DevMod.into(),
-
+            "fdo.bmo" => FdoServiceInfoModule::Bmo.into(),
             other => ServiceInfoModule::Unsupported(other.to_string()),
         })
     }
@@ -72,18 +56,6 @@ impl FromStr for ServiceInfoModule {
 impl From<StandardServiceInfoModule> for ServiceInfoModule {
     fn from(module: StandardServiceInfoModule) -> Self {
         ServiceInfoModule::Standard(module)
-    }
-}
-
-impl From<FedoraIotServiceInfoModule> for ServiceInfoModule {
-    fn from(module: FedoraIotServiceInfoModule) -> Self {
-        ServiceInfoModule::FedoraIot(module)
-    }
-}
-
-impl From<RedHatComServiceInfoModule> for ServiceInfoModule {
-    fn from(module: RedHatComServiceInfoModule) -> Self {
-        ServiceInfoModule::RedHatCom(module)
     }
 }
 
@@ -97,14 +69,6 @@ impl Display for ServiceInfoModule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ServiceInfoModule::Standard(module) => module.fmt(f),
-            ServiceInfoModule::FedoraIot(module) => {
-                write!(f, "org.fedoraiot.")?;
-                Display::fmt(module, f)
-            }
-            ServiceInfoModule::RedHatCom(module) => {
-                write!(f, "com.redhat.")?;
-                Display::fmt(module, f)
-            }
             ServiceInfoModule::Fdo(module) => {
                 write!(f, "fdo.")?;
                 Display::fmt(module, f)
@@ -127,50 +91,6 @@ impl Display for StandardServiceInfoModule {
             "{}",
             match self {
                 StandardServiceInfoModule::DevMod => "devmod",
-            }
-        )
-    }
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FedoraIotServiceInfoModule {
-    Command,
-    SSHKey,
-    BinaryFile,
-    DiskEncryptionClevis,
-    Reboot,
-}
-
-impl Display for FedoraIotServiceInfoModule {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                FedoraIotServiceInfoModule::Command => "command",
-                FedoraIotServiceInfoModule::SSHKey => "sshkey",
-                FedoraIotServiceInfoModule::BinaryFile => "binaryfile",
-                FedoraIotServiceInfoModule::DiskEncryptionClevis => "diskencryption-clevis",
-                FedoraIotServiceInfoModule::Reboot => "reboot",
-            }
-        )
-    }
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum RedHatComServiceInfoModule {
-    SubscriptionManager,
-}
-
-impl Display for RedHatComServiceInfoModule {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                RedHatComServiceInfoModule::SubscriptionManager => "subscriptionmanager",
             }
         )
     }

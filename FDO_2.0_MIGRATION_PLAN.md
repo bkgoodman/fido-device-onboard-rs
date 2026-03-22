@@ -85,27 +85,44 @@ BMO (fdo.bmo) is a critical FSIM for UEFI/firmware environments. It allows the
 owner server to deliver boot images, BIOS parameters, and Secure Boot keys to
 the device during onboarding via the ServiceInfo exchange (messages 88/89).
 
-**Device-side (client-linuxapp) responsibilities:**
-- [ ] Advertise `fdo.bmo` module in devmod active modules list
-- [ ] Handle `fdo.bmo:active` (enable/disable BMO module)
-- [ ] Handle `fdo.bmo:image-type` (receive MIME type of boot image)
-- [ ] Handle `fdo.bmo:image-length` (total size of incoming image)
-- [ ] Handle `fdo.bmo:image-begin` (start of image transfer, optional hash for verification)
-- [ ] Handle `fdo.bmo:image-data` (receive image data chunks, reassemble)
-- [ ] Handle `fdo.bmo:image-end` (end of transfer, verify hash if provided)
-- [ ] Handle `fdo.bmo:image-ack` (send acknowledgment with status/error code)
-- [ ] Handle `fdo.bmo:set` (receive BIOS/UEFI parameter key=value pairs)
-- [ ] Handle `fdo.bmo:set-ack` (acknowledge parameter setting)
-- [ ] Handle `fdo.bmo:supported-types` (report supported image MIME types)
-- [ ] Handle `fdo.bmo:error` (report errors back to owner)
-- [ ] Image storage: write received image to configurable path or UEFI variable
-- [ ] BIOS parameter storage: write key=value pairs to UEFI variables or config file
-- [ ] Secure Boot DB/DBX modification support (optional, platform-dependent)
-- [ ] URL-based image delivery (`fdo.bmo:image-url` mode - download from URL instead of inline)
-- [ ] Meta-payload support (`fdo.bmo:meta-url` - signed metadata with URL reference)
-- [ ] Integration test: Go server with `-bmo-file` sends image, Rust client receives and writes
-- [ ] Integration test: Go server with `-bmo-set key=value` sends params, Rust client applies
-- [ ] Integration test: Go server with `-bmo-url` sends URL reference, Rust client downloads
+**Device-side (client-linuxapp) -- implemented:**
+- [x] Register `fdo.bmo` module (`FdoServiceInfoModule::Bmo` in serviceinfo_names.rs)
+- [x] Advertise `fdo.bmo` module in devmod active modules list
+- [x] Handle `fdo.bmo:active` (enable/disable BMO module via `active_modules` set)
+- [x] Handle `fdo.bmo:image-begin` (parse CBOR map with integer keys: image_type, total_size, hash_alg, require_ack, delivery_mode, name, boot_args, url)
+- [x] Handle `fdo.bmo:image-ack` (send CBOR array `[true]` or `[false, code, msg]` when RequireAck set)
+- [x] Handle `fdo.bmo:image-data-N` (receive chunked image data, accumulate across ServiceInfo rounds)
+- [x] Handle `fdo.bmo:image-end` (parse hash from CBOR map, verify SHA-256/384, write image to disk)
+- [x] Handle `fdo.bmo:image-result` (send CBOR array `[status, msg]` after finalization)
+- [x] Handle `fdo.bmo:set` (receive CBOR array of `[name, value]` BIOS parameter pairs)
+- [x] Handle `fdo.bmo:response` (send CBOR array `[status, msg]` per parameter)
+- [x] Image storage: write received image to configurable `BMO_OUTPUT_DIR` (default `/tmp/fdo-bmo`)
+- [x] BIOS parameter storage: write key=value pairs to `bios_params` file
+- [x] Boot args: write to `boot_args` file if provided in image-begin
+- [x] NAK support: reject unsupported delivery modes with error code 14
+- [x] Fix `is_more_service_info` handling (ServiceInfo loop continues across multiple rounds)
+- [x] Persist `active_modules` and `BmoInProgress` state across ServiceInfo loop iterations
+- [x] Integration test: Go server with `-bmo-file` sends 64KB image, Rust client receives, hash-verifies, and writes (byte-for-byte match confirmed)
+- [x] URL delivery mode (delivery_mode=1): accept URL from server, write URL info + metadata to `bmo-url.txt`
+- [x] Meta-URL delivery mode (delivery_mode=2): accept meta-URL, write info to `bmo-meta-url.txt`, save TLS CA / expected hash / meta signer if provided
+- [x] Integration test: Go server with `-bmo-url` sends URL, Rust client receives and writes URL info (verified)
+- [x] Integration test: Go server with `-bmo` + `-bmo-set` combined (image delivered, BIOS params subject to server sequencing)
+- [x] Meta-URL fetch and CBOR parse (delivery_mode=2): fetch meta-payload from URL, parse integer-keyed CBOR map, extract resolved image_url / image_type / hash / name
+- [x] Integration test: Go `meta create` builds CBOR, Python HTTP serves it, Rust client fetches and resolves (verified image_url, name, hash_alg)
+
+**Remaining (platform-specific -- not protocol work):**
+
+The BMO protocol plumbing is complete. All message types and delivery modes
+are received, parsed, and logged. The reference implementation writes data to
+files. The items below are platform-specific actions that a real integration
+would implement in the BMO callback layer (see README "Integrating with your
+platform"):
+
+- [ ] Secure Boot DB/DBX enrollment (image type `application/x-uefi-db-cert`, `application/x-uefi-dbx-hash` -- received as inline images, platform applies them)
+- [ ] UEFI variable storage for BIOS parameters (currently writes to flat file)
+- [ ] URL fetch for delivery mode 1 (currently writes URL to info file; platform fetches)
+- [ ] Actual image fetch for resolved meta-URL (currently logs resolved URL; platform fetches)
+- [ ] COSE Sign1 signature verification for signed meta-payloads
 
 **Key Go server flags for testing:**
 ```bash
@@ -139,6 +156,23 @@ go run ./cmd server -bmo-meta-url "http://example.com/meta.json:signer.key:ca.pe
 - [ ] Update workspace `Cargo.toml` (client-only members)
 - [ ] Remove unused dependencies
 - [ ] Update `README.md`
+
+### 5c: Remove Unnecessary FSIMs
+Only `devmod` (required by protocol) and `fdo.bmo` (bare metal onboarding) are
+needed for the target environments (firmware, UEFI, OS installer). All other
+FSIMs are Linux-specific and assume a running OS -- the opposite of our use case.
+
+- [ ] Remove `org.fedoraiot.sshkey` FSIM (requires running OS with user accounts)
+- [ ] Remove `org.fedoraiot.binaryfile` FSIM (arbitrary file write to running OS)
+- [ ] Remove `org.fedoraiot.command` FSIM (shell command execution on running OS)
+- [ ] Remove `org.fedoraiot.reboot` FSIM (OS-level reboot)
+- [ ] Remove `org.fedoraiot.diskencryption-clevis` FSIM (LUKS/Clevis, requires full OS + TPM stack)
+- [ ] Remove `com.redhat.subscriptionmanager` FSIM (RHEL subscription, requires running OS)
+- [ ] Remove corresponding enum variants from `FedoraIotServiceInfoModule` and `RedHatComServiceInfoModule`
+- [ ] Remove `find_available_modules()` checks for `/usr/bin/clevis`, `/usr/sbin/subscription-manager`
+- [ ] Remove `libcryptsetup-rs`, `devicemapper`, `nix` dependencies from `client-linuxapp`
+- [ ] Remove `fdo-util/passwd_shadow` dependency
+- [ ] Audit remaining dependencies -- `sys-info` may also be removable if devmod can be simplified
 
 ### 5b: Warnings & Linting
 - [ ] `cargo clippy` clean (fix all warnings across workspace)
@@ -221,8 +255,9 @@ go run ./cmd server -bmo-meta-url "http://example.com/meta.json:signer.key:ca.pe
 - [x] Device-first attestation (ProveDevice20 before ProveOVHdr20)
 - [x] Service info exchange works (devmod module)
 - [x] Credential reuse protocol works
-- [ ] BMO FSIM: device receives boot image from owner server
-- [ ] BMO FSIM: device receives BIOS parameters from owner server
+- [x] BMO FSIM: device receives boot image from owner server
+- [x] BMO FSIM: device receives URL delivery info from owner server
+- [x] BMO FSIM: device receives BIOS parameters (handler implemented; platform-specific application deferred to integrator)
 - [ ] All server code removed
 - [x] Optional delegate support compiles conditionally
 - [ ] All integration tests pass in CI
