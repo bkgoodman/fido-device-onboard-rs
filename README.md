@@ -209,6 +209,120 @@ DEVICE_CREDENTIAL=cred.bin \
 ./target/release/fdo-client-linuxapp
 ```
 
+## TPM Support
+
+The Rust FDO clients can store device keys in a hardware TPM 2.0 instead of
+on the filesystem. This keeps the signing key and HMAC key inside the TPM
+where they cannot be extracted.
+
+### Build flags
+
+TPM key storage is selected at runtime via the `--key-ref` flag on the
+manufacturing client. No special Cargo feature flags are needed -- the
+`tss-esapi` dependency is always compiled.
+
+| `--key-ref` value | Key storage | Credential metadata | Use case |
+|---|---|---|---|
+| `filesystem` | DER files on disk | File (`cred.bin`) | Development, testing, non-TPM hardware |
+| `tpm` | TPM 2.0 persistent handles | File (`cred.bin`) | Production hardware with TPM |
+
+### DI with TPM key storage
+
+```bash
+# DI -- keys are generated inside the TPM; credential metadata written to file
+DEVICE_CREDENTIAL_FILENAME=cred.bin \
+MANUFACTURING_INFO=my-device \
+./target/release/fdo-manufacturing-client plain-di \
+    --manufacturing-server-url http://localhost:9999 \
+    --mfg-string-type SerialNumber \
+    --key-ref tpm \
+    --fdo-version 200
+```
+
+The TPM is auto-detected via the `TSS2_TCTI_NAME` environment variable or
+falls back to `/dev/tpmrm0` (the Linux kernel resource manager).
+
+### Onboarding (TO1/TO2) with TPM
+
+After DI, the onboarding client (`fdo-client-linuxapp`) uses the credential
+file produced by DI together with the TPM-resident keys to complete TO1 and
+TO2:
+
+```bash
+DEVICE_CREDENTIAL=cred.bin \
+ALLOW_NONINTEROPERABLE_KDF=1 \
+./target/release/fdo-client-linuxapp
+```
+
+The signing key remains in the TPM throughout the onboarding flow -- the
+credential file contains only metadata (GUID, rendezvous info, public key
+hash), never secret material.
+
+### Cross-project verification with Go FDO
+
+The [Go FDO](../go-fdo) project provides CLI commands that inspect
+TPM-stored FDO credentials. When both implementations follow the
+["Securing FDO Credentials in the TPM"](https://fidoalliance.org/specs/FDO/)
+specification for NV index layout, credentials written by the Rust client
+can be read and displayed by the Go client as proof of spec compliance:
+
+```bash
+# Build Go client with TPM support
+cd ../go-fdo/examples && go build -tags=tpm -o fdo ./cmd
+
+# Inspect what the Rust DI wrote to the TPM
+./fdo client -tpm-show           # Display all NV indices, GUID, RV info, key type
+./fdo client -tpm-export-dak     # Export DAK public key as PEM
+./fdo client -tpm-prove          # Sign a challenge with the DAK to prove possession
+```
+
+`tpm-show` output includes:
+- **DCActive** -- whether the device is initialized
+- **DCTPM** -- device GUID and DeviceInfo string
+- **DCOV** -- protocol version, key type, owner public key hash, rendezvous URLs
+- **DAK** -- the Device Attestation Key curve and public coordinates
+- **HMAC Key** -- presence of the persistent HMAC key
+
+If Go can successfully parse and display credentials provisioned by the Rust
+client, it confirms both implementations agree on the TPM NV index layout,
+CBOR encoding, and key formats defined by the specification.
+
+### End-to-end TPM interop test
+
+The full cross-language TPM verification flow:
+
+```bash
+# 1. Start Go FDO server
+cd ../go-fdo/examples
+go run ./cmd server -http 127.0.0.1:9999 -db test.db -reuse-cred &
+
+# 2. Rust DI -- provisions TPM with device credentials
+cd ../fido-device-onboard-rs
+DEVICE_CREDENTIAL_FILENAME=cred.bin \
+MANUFACTURING_INFO=rust-tpm-test \
+./target/release/fdo-manufacturing-client plain-di \
+    --manufacturing-server-url http://127.0.0.1:9999 \
+    --mfg-string-type SerialNumber \
+    --key-ref tpm \
+    --fdo-version 200
+
+# 3. Go inspects TPM -- proof of compliance
+cd ../go-fdo/examples
+go build -tags=tpm -o fdo ./cmd
+./fdo client -tpm-show            # ← Rust-written creds, read by Go
+./fdo client -tpm-export-dak      # ← DAK created by Rust, exported by Go
+
+# 4. Rust onboarding -- TO1/TO2 using TPM-resident keys
+cd ../fido-device-onboard-rs
+DEVICE_CREDENTIAL=cred.bin \
+ALLOW_NONINTEROPERABLE_KDF=1 \
+./target/release/fdo-client-linuxapp
+
+# 5. Go inspects again -- credential updated after onboarding
+cd ../go-fdo/examples
+./fdo client -tpm-show            # ← Updated GUID and RV info after TO2
+```
+
 ## Legacy crates (upstream, being removed)
 
 These crates are from the upstream project and are slated for removal:

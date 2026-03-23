@@ -231,7 +231,54 @@ FSIMs are Linux-specific and assume a running OS -- the opposite of our use case
 
 ## Phase 8: TPM Integration & New TPM Spec Standardization
 
-- [ ] Evaluate current TPM usage (tss2-esys dependency, key storage via TPM)
+### 8a: Make TPM a compile-time option (feature flag)
+
+Current state: `tss-esapi` is a **hard dependency** in `data-formats` and
+`manufacturing-client`. No feature flag exists. If `tpm2-tss-devel` is not
+installed, nothing compiles. On UEFI platforms with different TPM libraries,
+`tss-esapi` is useless.
+
+The existing abstraction is clean (3 enums: `KeyStorageType`, `KeyStorage`,
+`KeyReference` with filesystem/TPM variants). The TPM code is concentrated
+in two files (~450 lines total):
+- `data-formats/src/devicecredential/file.rs` -- `TpmCoseSigner`, HMAC, signing (~250 lines)
+- `manufacturing-client/src/main.rs` -- Key generation, templates, public key extraction (~200 lines)
+
+- [ ] Add `tpm_support` feature flag to `data-formats/Cargo.toml` (makes `tss-esapi` optional)
+- [ ] Add `tpm_support` feature flag to `manufacturing-client/Cargo.toml` (forwards to data-formats)
+- [ ] Gate `KeyStorage::Tpm` variant with `#[cfg(feature = "tpm_support")]`
+- [ ] Gate `KeyReference::SemiTpm` variant with `#[cfg(feature = "tpm_support")]`
+- [ ] Gate `TpmCoseSigner` struct and impl with `#[cfg(feature = "tpm_support")]`
+- [ ] Gate TPM key generation functions (`get_new_key_tpm`, templates) with `#[cfg(feature = "tpm_support")]`
+- [ ] Gate TPM HMAC path in `perform_hmac()` with `#[cfg(feature = "tpm_support")]`
+- [ ] Gate `TssError` variant in `errors.rs` with `#[cfg(feature = "tpm_support")]`
+- [ ] Return clear error when loading TPM credential without `tpm_support` feature
+- [ ] Verify builds with `--features tpm_support` (full TPM, current behavior)
+- [ ] Verify builds with `--no-default-features` (no TPM, no delegate)
+- [ ] Verify builds with default features (decide: TPM on or off by default)
+- [ ] Test DI with `--key-ref filesystem` still works without TPM feature
+- [ ] Test DI with `--key-ref tpm` works with TPM feature (requires TPM hardware)
+
+### 8b: TPM trait abstraction for portability
+
+The goal is that a UEFI implementation can swap in a different TPM library
+(e.g. UEFI TCG protocol) without changing protocol code. The `DeviceCredential`
+trait's `get_signer() -> Box<dyn SigningPrivateKey>` is already the right
+boundary. The TPM-specific part is below that.
+
+- [ ] Extract TPM operations into a `TpmProvider` trait:
+  - `create_primary()` -- create primary key in owner hierarchy
+  - `create_signing_key()` -- create ECC signing key under primary
+  - `create_hmac_key()` -- create HMAC key under primary
+  - `load_key()` -- load key from public/private blobs
+  - `sign()` -- sign digest with loaded key
+  - `hmac()` -- compute HMAC with loaded key
+- [ ] Implement `TpmProvider` for `tss-esapi` (Linux userspace, current code)
+- [ ] Document `TpmProvider` trait for UEFI implementors
+- [ ] Implement CSR generation for TPM keys (currently bails with "not yet supported")
+
+### 8c: New TPM spec alignment
+
 - [ ] Review proposed new TPM specification for FDO device attestation
 - [ ] Align device key storage with new TPM spec requirements
   - [ ] TPM-backed device signing key generation during DI
@@ -242,7 +289,6 @@ FSIMs are Linux-specific and assume a running OS -- the opposite of our use case
   - [ ] EK/AK certificate chain validation
   - [ ] Device identity binding to TPM endorsement hierarchy
 - [ ] Evaluate TPM 2.0 vs fTPM (firmware TPM) support requirements for UEFI targets
-- [ ] Assess whether tss2-esys can be made optional (feature flag) for platforms without TPM
 - [ ] Coordinate with FIDO Alliance / TCG on spec alignment
 - [ ] Integration test: DI with TPM-backed keys against Go server
 - [ ] Integration test: TO2 with TPM attestation against Go server
