@@ -7,7 +7,9 @@
 # Tests Rust FDO 2.0 client against Go FDO server
 #
 # Usage: ./test_rust_fdo20_interop.sh [test_name]
-#   test_name: di-fdo20, full-fdo20, delegate, all (default: all)
+#   test_name: di-fdo20, full-fdo20, delegate, bmo, bmo-url, bmo-set, bmo-meta-url,
+#              tpm-cross, tpm-rust-di-go-onboard, tpm-go-di-rust-onboard, all (default: all)
+#   TPM tests require /dev/tpmrm0, tpm2-tools, and libtss2-dev
 #
 
 set -e
@@ -545,6 +547,101 @@ test_bmo_meta_url() {
 }
 
 # ============================================================
+# Test: TPM Cross-Implementation (Rust DI -> Go Onboard)
+# Requires: /dev/tpmrm0, tpm_support feature, Go TPM client
+# ============================================================
+test_tpm_rust_di_go_onboard() {
+	log_section "TEST: TPM Cross-Impl: Rust DI -> Go Onboard"
+	log_info "Rust provisions TPM NV indices during DI, Go onboards using them"
+
+	rm -f "$DB_FILE"
+
+	# Build with TPM support
+	log_step "Building Rust client with TPM support"
+	RUSTFLAGS="-L $(pwd)/target/lib" \
+	run_cmd cargo build --release -p fdo-manufacturing-client --features tpm_support || return 1
+
+	# Build Go TPM client
+	log_step "Building Go TPM client"
+	(cd "$GO_FDO_DIR/examples" && go build -tags=tpm -o /tmp/fdo-tpm-client ./cmd) || return 1
+	log_success "Go TPM client built"
+
+	start_go_server "-reuse-cred" || return 1
+
+	log_step "Step 1: Rust DI with TPM (NV-based storage)"
+	export TSS2_TCTI="device:/dev/tpmrm0"
+	export LD_LIBRARY_PATH="$(pwd)/target/lib:$LD_LIBRARY_PATH"
+	MANUFACTURING_INFO="tpm-cross-test" \
+	RUST_LOG=info \
+	run_cmd ./target/release/fdo-manufacturing-client plain-di \
+		--manufacturing-server-url "$SERVER_URL" \
+		--mfg-string-type SerialNumber \
+		--key-ref tpm \
+		--fdo-version 200 || return 1
+	log_success "Rust DI completed (credentials in TPM NV)"
+
+	log_step "Step 2: Go tpm-show (verify NV introspection)"
+	/tmp/fdo-tpm-client client -tpm-show || return 1
+	log_success "Go can read Rust-provisioned TPM NV"
+
+	log_step "Step 3: Go tpm-prove (verify DAK policy compatibility)"
+	/tmp/fdo-tpm-client client -tpm-prove || return 1
+	log_success "Go can use Rust-created DAK with policy session"
+
+	log_step "Step 4: Go onboard (TO1 + TO2)"
+	/tmp/fdo-tpm-client client -fdo-version 200 || return 1
+	log_success "Go onboard completed"
+
+	stop_server
+	log_success "TPM Cross-Impl (Rust DI -> Go Onboard) PASSED"
+}
+
+# ============================================================
+# Test: TPM Cross-Implementation (Go DI -> Rust Onboard)
+# Requires: /dev/tpmrm0, tpm_support feature, Go TPM client
+# ============================================================
+test_tpm_go_di_rust_onboard() {
+	log_section "TEST: TPM Cross-Impl: Go DI -> Rust Onboard"
+	log_info "Go provisions TPM NV indices during DI, Rust onboards using them"
+
+	rm -f "$DB_FILE"
+
+	# Build Rust client with TPM support
+	log_step "Building Rust client with TPM support"
+	RUSTFLAGS="-L $(pwd)/target/lib" \
+	run_cmd cargo build --release -p fdo-client-linuxapp --features tpm_support || return 1
+
+	# Build Go TPM client
+	log_step "Building Go TPM client"
+	(cd "$GO_FDO_DIR/examples" && go build -tags=tpm -o /tmp/fdo-tpm-client ./cmd) || return 1
+	log_success "Go TPM client built"
+
+	start_go_server "-reuse-cred" || return 1
+
+	log_step "Step 1: Clear TPM state"
+	export TSS2_TCTI="device:/dev/tpmrm0"
+	tpm2_clear -c lockout 2>/dev/null || true
+	export FDO_TPM_OWNER_HIERARCHY=1
+	/tmp/fdo-tpm-client client -tpm-clear 2>/dev/null || true
+	log_success "TPM state cleared"
+
+	log_step "Step 2: Go DI with TPM"
+	/tmp/fdo-tpm-client client -di "$SERVER_URL" -di-key ec256 || return 1
+	log_success "Go DI completed (credentials in TPM NV)"
+
+	log_step "Step 3: Rust onboard (TO1 + TO2 from TPM NV)"
+	export LD_LIBRARY_PATH="$(pwd)/target/lib:$LD_LIBRARY_PATH"
+	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=/tmp/fdo_onboard_marker_tpm_cross \
+	ALLOW_NONINTEROPERABLE_KDF=1 \
+	RUST_LOG=info \
+	run_cmd ./target/release/fdo-client-linuxapp || return 1
+	log_success "Rust onboard completed"
+
+	stop_server
+	log_success "TPM Cross-Impl (Go DI -> Rust Onboard) PASSED"
+}
+
+# ============================================================
 # Main test runner
 # ============================================================
 main() {
@@ -587,6 +684,25 @@ main() {
 		bmo-meta-url)
 			test_bmo_meta_url
 			;;
+		tpm-rust-di-go-onboard)
+			test_tpm_rust_di_go_onboard
+			;;
+		tpm-go-di-rust-onboard)
+			test_tpm_go_di_rust_onboard
+			;;
+		tpm-cross)
+			local failed=0
+			test_tpm_rust_di_go_onboard || failed=1
+			test_tpm_go_di_rust_onboard || failed=1
+			echo ""
+			log_section "TPM Cross-Implementation Summary"
+			if [ $failed -eq 0 ]; then
+				log_success "All TPM cross-impl tests PASSED"
+			else
+				log_error "Some TPM cross-impl tests FAILED"
+				exit 1
+			fi
+			;;
 		all)
 			local failed=0
 			test_di_fdo20 || failed=1
@@ -607,7 +723,9 @@ main() {
 			fi
 			;;
 		*)
-			echo "Usage: $0 [di-fdo20|full-fdo20|delegate|bmo|bmo-url|bmo-set|bmo-meta-url|all]"
+			echo "Usage: $0 [di-fdo20|full-fdo20|delegate|bmo|bmo-url|bmo-set|bmo-meta-url|tpm-cross|tpm-rust-di-go-onboard|tpm-go-di-rust-onboard|all]"
+			echo ""
+			echo "TPM tests require: /dev/tpmrm0 access, tpm2-tools, libtss2-dev"
 			exit 1
 			;;
 	esac

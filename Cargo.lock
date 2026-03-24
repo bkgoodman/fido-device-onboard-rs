@@ -1057,6 +1057,7 @@ name = "fdo-manufacturing-client"
 version = "0.5.5"
 dependencies = [
  "anyhow",
+ "ciborium",
  "clap 4.4.18",
  "clap_builder",
  "fdo-data-formats",
@@ -1067,6 +1068,7 @@ dependencies = [
  "openssl",
  "rand",
  "regex",
+ "serde_cbor",
  "tokio",
  "tss-esapi",
 ]

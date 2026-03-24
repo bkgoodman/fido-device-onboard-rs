@@ -65,7 +65,14 @@ Available interop tests:
 | `di-fdo20` | DI with FDO 2.0 protocol |
 | `full-fdo20` | Full flow DI + TO1 + TO2 (Rust client, FDO 2.0) |
 | `delegate` | TO2 with delegate certificate chain |
-| `all` | Run all interop tests (default) |
+| `bmo` | BMO image transfer |
+| `bmo-url` | BMO URL delivery mode |
+| `bmo-set` | BMO BIOS parameter setting |
+| `bmo-meta-url` | BMO meta-URL delivery mode |
+| `tpm-cross` | All TPM cross-implementation tests (requires /dev/tpmrm0) |
+| `tpm-rust-di-go-onboard` | Rust DI -> Go onboard via TPM NV |
+| `tpm-go-di-rust-onboard` | Go DI -> Rust onboard via TPM NV |
+| `all` | Run all interop tests except TPM (default) |
 
 ## Development Workflow
 
@@ -340,5 +347,42 @@ See `FDO_2.0_MIGRATION_PLAN.md` for the full checklist.
 - Protocol version negotiation via CapabilityFlags
 - Key exchange testing (ECDH, ASYMKEX)
 - Credential integrity (HMAC verification)
+
+## Known Issues / TODOs
+
+### TPM PolicyNV Workaround (tss-esapi 7.6)
+
+**Status:** Active workaround in `data-formats/src/tpm/policy.rs`
+
+`tss-esapi` 7.6 does not implement `TPM2_PolicyNV`. This was explicitly skipped
+in the original implementation (https://github.com/parallaxsecond/rust-tss-esapi/pull/95)
+because "some of them require complicated structures." `HMAC_Start`,
+`SequenceUpdate`, and `SequenceComplete` are also missing.
+
+**Workaround:** We open a **second, independent ESYS connection** to the same
+TPM device using `tss-esapi-sys` (the raw C FFI layer) and call `Esys_PolicyNV`
+directly on that connection. The policy session is built entirely on the second
+connection (StartAuthSession + PolicyNV + PolicySecret + Sign/HMAC), because
+ESYS_TR session handles are context-local and cannot be transferred between
+ESYS contexts.
+
+The trial policy digest (for key creation) is computed in **pure software** by
+replicating the TPM's hash extension algorithm, avoiding the TPM call entirely.
+
+**Why we can't call raw FFI on the primary context:**
+- `tss_esapi::Context` is not `#[repr(C)]`, so rustc may reorder struct fields
+- The `ESYS_CONTEXT*` pointer is in a private field (`mut_context()`)
+- We cannot reliably extract the pointer to make raw ESYS calls
+
+**Resolution:** This workaround should be removed when:
+- `tss-esapi` adds `policy_nv()` (file a PR upstream)
+- We upgrade to a version that includes it
+- `tss-esapi::Context` exposes the raw `ESYS_CONTEXT*`
+
+**Remaining issue:** The software-computed auth policy digest may not match the
+TPM-computed digest. This needs investigation -- the PolicyNV hash extension
+format (args hash, operand encoding) must exactly match the TPM's implementation.
+See `compute_fdo_auth_policy()` in `data-formats/src/tpm/policy.rs`.
+
 
 This document helps AI agents understand the Rust FDO client migration project structure, development workflow, and testing patterns.

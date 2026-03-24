@@ -233,10 +233,10 @@ FSIMs are Linux-specific and assume a running OS -- the opposite of our use case
 
 ### 8a: Make TPM a compile-time option (feature flag)
 
-Current state: `tss-esapi` is a **hard dependency** in `data-formats` and
-`manufacturing-client`. No feature flag exists. If `tpm2-tss-devel` is not
-installed, nothing compiles. On UEFI platforms with different TPM libraries,
-`tss-esapi` is useless.
+Current state: `tss-esapi` is a **hard dependency** in `data-formats`,
+`manufacturing-client`, and `owner-tool`. No feature flag exists. If
+`tpm2-tss-devel` is not installed, nothing compiles. On UEFI platforms with
+different TPM libraries, `tss-esapi` is useless.
 
 The existing abstraction is clean (3 enums: `KeyStorageType`, `KeyStorage`,
 `KeyReference` with filesystem/TPM variants). The TPM code is concentrated
@@ -244,20 +244,29 @@ in two files (~450 lines total):
 - `data-formats/src/devicecredential/file.rs` -- `TpmCoseSigner`, HMAC, signing (~250 lines)
 - `manufacturing-client/src/main.rs` -- Key generation, templates, public key extraction (~200 lines)
 
-- [ ] Add `tpm_support` feature flag to `data-formats/Cargo.toml` (makes `tss-esapi` optional)
-- [ ] Add `tpm_support` feature flag to `manufacturing-client/Cargo.toml` (forwards to data-formats)
-- [ ] Gate `KeyStorage::Tpm` variant with `#[cfg(feature = "tpm_support")]`
-- [ ] Gate `KeyReference::SemiTpm` variant with `#[cfg(feature = "tpm_support")]`
-- [ ] Gate `TpmCoseSigner` struct and impl with `#[cfg(feature = "tpm_support")]`
-- [ ] Gate TPM key generation functions (`get_new_key_tpm`, templates) with `#[cfg(feature = "tpm_support")]`
-- [ ] Gate TPM HMAC path in `perform_hmac()` with `#[cfg(feature = "tpm_support")]`
-- [ ] Gate `TssError` variant in `errors.rs` with `#[cfg(feature = "tpm_support")]`
-- [ ] Return clear error when loading TPM credential without `tpm_support` feature
-- [ ] Verify builds with `--features tpm_support` (full TPM, current behavior)
-- [ ] Verify builds with `--no-default-features` (no TPM, no delegate)
-- [ ] Verify builds with default features (decide: TPM on or off by default)
-- [ ] Test DI with `--key-ref filesystem` still works without TPM feature
-- [ ] Test DI with `--key-ref tpm` works with TPM feature (requires TPM hardware)
+- [x] Add `tpm_support` feature flag to `data-formats/Cargo.toml` (makes `tss-esapi` optional)
+- [x] Add `tpm_support` feature flag to `manufacturing-client/Cargo.toml` (forwards to data-formats)
+- [x] Add `tpm_support` feature flag to `owner-tool/Cargo.toml` (forwards to data-formats)
+- [x] Gate `KeyStorage::Tpm` match arms with `#[cfg(feature = "tpm_support")]`
+- [x] Gate `KeyReference::SemiTpm` variant with `#[cfg(feature = "tpm_support")]`
+- [x] Gate `TpmCoseSigner` struct and impl with `#[cfg(feature = "tpm_support")]`
+- [x] Gate TPM key generation functions (`get_new_key_tpm`, templates) with `#[cfg(feature = "tpm_support")]`
+- [x] Gate TPM HMAC path in `perform_hmac()` with `#[cfg(feature = "tpm_support")]`
+- [x] Gate `TssError` variant in `errors.rs` with `#[cfg(feature = "tpm_support")]`
+- [x] Gate TPM inspection in `owner-tool/src/main.rs`
+- [x] Return clear error when loading TPM credential without `tpm_support` feature
+- [x] Verify builds without TPM feature (default: no TPM) -- `cargo check` passes, `cargo clippy` clean
+- [x] Verify builds with `--features tpm_support` (full TPM, current behavior) -- `cargo check` + `cargo clippy` clean
+- [x] Test DI with `--key-ref filesystem` still works without TPM feature -- full interop suite passes (DI, TO1/TO2, delegate, BMO)
+- [x] Test DI with `--key-ref tpm` works with TPM feature -- DI + TO1 + TO2 against Go server (P-256, real hardware TPM)
+
+**Additional fixes during TPM testing:**
+- [x] Fix `str_key()` and `env_key()` to route `--key-ref tpm` to `get_new_key_tpm()` (was dead code)
+- [x] Auto-detect TPM curve support (try P-256 first, fall back to P-384)
+- [x] Detect actual key type from TPM public key in `get_public_key_type()` (was hardcoded P-384)
+- [x] Implement CSR generation for TPM keys (sign TBS with TPM, assemble DER)
+- [x] Remove `generate-bindings` default (no longer requires `libclang-dev`); available as `tpm_generate_bindings` feature
+- Note: `client-linuxapp` TCTI fallback is `Tabrmd`; set `TSS2_TCTI=device:/dev/tpmrm0` for direct access
 
 ### 8b: TPM trait abstraction for portability
 
@@ -279,19 +288,30 @@ boundary. The TPM-specific part is below that.
 
 ### 8c: New TPM spec alignment
 
-- [ ] Review proposed new TPM specification for FDO device attestation
-- [ ] Align device key storage with new TPM spec requirements
-  - [ ] TPM-backed device signing key generation during DI
-  - [ ] TPM-sealed HMAC key storage
-  - [ ] TPM-based credential protection (seal/unseal with PCR policy)
-- [ ] Implement TPM attestation flow per new spec
-  - [ ] Platform measurement (PCR quotes) during TO2
-  - [ ] EK/AK certificate chain validation
-  - [ ] Device identity binding to TPM endorsement hierarchy
-- [ ] Evaluate TPM 2.0 vs fTPM (firmware TPM) support requirements for UEFI targets
-- [ ] Coordinate with FIDO Alliance / TCG on spec alignment
-- [ ] Integration test: DI with TPM-backed keys against Go server
-- [ ] Integration test: TO2 with TPM attestation against Go server
+**Completed: NV-based credential storage (DI side)**
+- [x] New `data-formats/src/tpm/` module: `mod.rs` (constants, profiles, context), `nv.rs` (NV operations), `key.rs` (key management)
+- [x] NV index constants matching Go: `0x01D10000`-`0x01D10005` (DCActive, DCTPM, DCOV, US indices)
+- [x] Persistent handle constants: `0x81020002` (DAK), `0x81020003` (HMAC key)
+- [x] NV attribute profiles A/B/C per spec Table 9
+- [x] Spec-compliant ECC key creation under Endorsement hierarchy with unique strings
+- [x] Spec-compliant HMAC key creation under Endorsement hierarchy with unique strings
+- [x] Persistent key handles via `TPM2_EvictControl`
+- [x] `KeyReference::SpecTpm` variant in manufacturing-client with full NV provisioning flow
+- [x] DI stores credentials in NV indices (DCTPM: GUID+DeviceInfo, DCOV: CBOR metadata, DCActive: flag) -- no file written
+- [x] Integration test: DI with NV-backed keys against Go server (verified with `tpm2_nvreadpublic`)
+
+**Remaining: TO2 side (load from NV)**
+- [ ] Update `client-linuxapp` to discover and load credentials from TPM NV indices
+- [ ] Read DCTPM/DCOV/DCActive from NV → reconstruct DeviceCredential
+- [ ] Load persistent DAK/HMAC key handles for TO1/TO2 signing
+- [ ] Integration test: full DI + TO1 + TO2 with NV-only credentials
+- [ ] Credential reuse: Save() updates NV indices after TO2
+
+**Deferred (policy session hardening):**
+- [ ] `userWithAuth=false` with PolicyNV + PolicySecret (tss-esapi 7.6 missing `PolicyNV`; using password auth)
+- [ ] HMAC sequence operations (tss-esapi 7.6 missing `HMAC_Start`/`SequenceUpdate`/`SequenceComplete`)
+- [ ] PCR quotes during TO2 (not in current Go implementation either)
+- [ ] EK/AK certificate chain validation
 
 ## Success Criteria
 

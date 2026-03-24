@@ -7,8 +7,9 @@ use clap::{Args, Parser, Subcommand};
 use regex::Regex;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::{convert::TryFrom, fs};
-use std::{convert::TryInto, env, str::FromStr};
+#[cfg(feature = "tpm_support")]
+use std::{convert::TryFrom, convert::TryInto};
+use std::{env, fs, str::FromStr};
 
 use fdo_data_formats::{
     constants::{
@@ -28,18 +29,19 @@ use fdo_http_wrapper::{
     client::{RequestResult, ServiceClient},
     EncryptionKeys,
 };
+#[cfg(feature = "tpm_support")]
+use openssl::{bn::BigNum, rsa::Rsa};
 use openssl::{
-    bn::BigNum,
     ec::{EcGroup, EcKey},
     hash::MessageDigest,
     nid::Nid,
     pkey::{PKey, Private},
-    rsa::Rsa,
     sign::Signer,
     x509::{X509NameBuilder, X509ReqBuilder},
 };
 
 use fdo_util::{device_credential_locations, device_identification};
+#[cfg(feature = "tpm_support")]
 use tss_esapi::{
     attributes::ObjectAttributesBuilder,
     interface_types::algorithm::HashingAlgorithm,
@@ -654,12 +656,151 @@ async fn get_mfg_info(
     Ok(CborSimpleType::Text(mfg_iden))
 }
 
+/// Extract the CertificationRequestInfo (TBS) bytes from a DER-encoded CSR.
+/// CSR DER = SEQUENCE { CertificationRequestInfo, SignatureAlgorithm, Signature }
+/// Returns the raw DER bytes of the first element (CertificationRequestInfo).
+#[cfg(feature = "tpm_support")]
+fn extract_tbs_from_csr_der(csr_der: &[u8]) -> Result<Vec<u8>> {
+    // The outer structure is a SEQUENCE. We need to skip the SEQUENCE tag+length
+    // and then read the first element (which is the CertificationRequestInfo SEQUENCE).
+    let (_, content) = parse_der_tag_length(csr_der).context("Error parsing outer CSR SEQUENCE")?;
+    let (tbs_len, _) = parse_der_tag_length(content).context("Error parsing TBS element")?;
+    // tbs_len is the total length of the TBS element including tag+length
+    Ok(content[..tbs_len].to_vec())
+}
+
+/// Parse a DER tag+length, return (total element size including tag+length, content start).
+#[cfg(feature = "tpm_support")]
+fn parse_der_tag_length(data: &[u8]) -> Result<(usize, &[u8])> {
+    if data.is_empty() {
+        bail!("Empty DER data");
+    }
+    // Skip the tag byte
+    let mut pos = 1;
+    if pos >= data.len() {
+        bail!("DER data too short for length");
+    }
+    let length_byte = data[pos];
+    pos += 1;
+    let content_length = if length_byte & 0x80 == 0 {
+        // Short form
+        length_byte as usize
+    } else {
+        // Long form
+        let num_bytes = (length_byte & 0x7f) as usize;
+        if num_bytes == 0 || num_bytes > 4 {
+            bail!("Invalid DER length encoding");
+        }
+        let mut len: usize = 0;
+        for _ in 0..num_bytes {
+            if pos >= data.len() {
+                bail!("DER data too short for length bytes");
+            }
+            len = (len << 8) | (data[pos] as usize);
+            pos += 1;
+        }
+        len
+    };
+    let total_element_size = pos + content_length;
+    if total_element_size > data.len() {
+        bail!("DER element extends past data");
+    }
+    Ok((total_element_size, &data[pos..]))
+}
+
+/// Convert ECDSA (r, s) values to DER-encoded signature.
+/// ECDSA-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }
+#[cfg(feature = "tpm_support")]
+fn ecdsa_sig_to_der(r: &[u8], s: &[u8]) -> Result<Vec<u8>> {
+    use openssl::bn::BigNum;
+    use openssl::ecdsa::EcdsaSig;
+
+    let r_bn = BigNum::from_slice(r).context("Error creating r BigNum")?;
+    let s_bn = BigNum::from_slice(s).context("Error creating s BigNum")?;
+    let sig = EcdsaSig::from_private_components(r_bn, s_bn).context("Error creating EcdsaSig")?;
+    sig.to_der().context("Error encoding ECDSA sig to DER")
+}
+
+/// Assemble a complete CSR DER from TBS bytes, DER-encoded signature, and key info.
+/// CertificationRequest ::= SEQUENCE {
+///     certificationRequestInfo  CertificationRequestInfo,
+///     signatureAlgorithm        AlgorithmIdentifier,
+///     signature                 BIT STRING
+/// }
+#[cfg(feature = "tpm_support")]
+fn assemble_csr_der(
+    tbs_bytes: &[u8],
+    sig_der: &[u8],
+    signing_pub: &tss_esapi::structures::Public,
+) -> Result<Vec<u8>> {
+    // Determine the signature algorithm OID
+    let sig_alg_der = match signing_pub {
+        tss_esapi::structures::Public::Ecc { parameters, .. } => {
+            match parameters.ecc_curve() {
+                tss_esapi::interface_types::ecc::EccCurve::NistP256 => {
+                    // ecdsa-with-SHA256: OID 1.2.840.10045.4.3.2
+                    // SEQUENCE { OID 1.2.840.10045.4.3.2 }
+                    vec![
+                        0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,
+                    ]
+                }
+                tss_esapi::interface_types::ecc::EccCurve::NistP384 => {
+                    // ecdsa-with-SHA384: OID 1.2.840.10045.4.3.3
+                    vec![
+                        0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03,
+                    ]
+                }
+                _ => bail!("Unsupported curve for CSR assembly"),
+            }
+        }
+        _ => bail!("Unsupported key type for CSR assembly"),
+    };
+
+    // BIT STRING wrapping for the signature: 0x03 <length> 0x00 <sig_der>
+    let bit_string_content_len = 1 + sig_der.len(); // 0x00 unused-bits byte + sig
+    let mut bit_string = vec![0x03];
+    encode_der_length(&mut bit_string, bit_string_content_len);
+    bit_string.push(0x00); // zero unused bits
+    bit_string.extend_from_slice(sig_der);
+
+    // Outer SEQUENCE
+    let inner_len = tbs_bytes.len() + sig_alg_der.len() + bit_string.len();
+    let mut csr = vec![0x30]; // SEQUENCE tag
+    encode_der_length(&mut csr, inner_len);
+    csr.extend_from_slice(tbs_bytes);
+    csr.extend_from_slice(&sig_alg_der);
+    csr.extend_from_slice(&bit_string);
+
+    Ok(csr)
+}
+
+/// Encode a DER length value.
+#[cfg(feature = "tpm_support")]
+fn encode_der_length(buf: &mut Vec<u8>, length: usize) {
+    if length < 0x80 {
+        buf.push(length as u8);
+    } else if length < 0x100 {
+        buf.push(0x81);
+        buf.push(length as u8);
+    } else if length < 0x10000 {
+        buf.push(0x82);
+        buf.push((length >> 8) as u8);
+        buf.push(length as u8);
+    } else {
+        buf.push(0x83);
+        buf.push((length >> 16) as u8);
+        buf.push((length >> 8) as u8);
+        buf.push(length as u8);
+    }
+}
+
 #[derive(Debug)]
 enum KeyReference {
     FileSystem {
         sign_key: PKey<Private>,
         hmac_key: Vec<u8>,
     },
+    #[cfg(feature = "tpm_support")]
     SemiTpm {
         tss_context: Box<tss_esapi::Context>,
         primary_handle: tss_esapi::handles::KeyHandle,
@@ -670,8 +811,26 @@ enum KeyReference {
         hmac_public: Vec<u8>,
         hmac_private: Vec<u8>,
     },
+    /// Spec-compliant TPM: keys in persistent handles, credentials in NV indices.
+    #[cfg(feature = "tpm_support")]
+    SpecTpm {
+        tss_context: Box<tss_esapi::Context>,
+        /// Persistent DAK handle for signing.
+        dak_handle: tss_esapi::handles::KeyHandle,
+        /// Persistent HMAC key handle.
+        hmac_handle: tss_esapi::handles::KeyHandle,
+        /// Marshalled public key bytes.
+        public_bytes: Vec<u8>,
+        /// Whether to use Platform hierarchy for NV (vs Owner).
+        use_platform: bool,
+        /// DeviceKey Unique String NV handle (for policy session auth).
+        dk_us_nv_handle: tss_esapi::handles::NvIndexHandle,
+        /// HMAC Unique String NV handle (for policy session auth).
+        hmac_us_nv_handle: tss_esapi::handles::NvIndexHandle,
+    },
 }
 
+#[cfg(feature = "tpm_support")]
 fn semi_tpm_hmac_key_template(keytype: PublicKeyType) -> Result<tss_esapi::structures::Public> {
     let hash_algo = match keytype {
         PublicKeyType::SECP256R1 => HashingAlgorithm::Sha256,
@@ -703,6 +862,7 @@ fn semi_tpm_hmac_key_template(keytype: PublicKeyType) -> Result<tss_esapi::struc
         .context("Error creating public template")
 }
 
+#[cfg(feature = "tpm_support")]
 fn semi_tpm_signing_key_template(key_type: PublicKeyType) -> Result<tss_esapi::structures::Public> {
     let primary_attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
@@ -777,6 +937,7 @@ impl KeyReference {
         }
     }
 
+    #[cfg(feature = "tpm_support")]
     async fn get_new_key_tpm(keytype: PublicKeyType) -> Result<Self> {
         let tcti_conf = match tss_esapi::tcti_ldr::TctiNameConf::from_environment_variable() {
             Ok(conf) => conf,
@@ -842,6 +1003,131 @@ impl KeyReference {
         })
     }
 
+    /// Spec-compliant TPM key generation: creates primary keys under Endorsement
+    /// hierarchy with unique strings, persists to spec-defined handles, provisions
+    /// NV indices for credential storage. No file written.
+    #[cfg(feature = "tpm_support")]
+    async fn get_new_key_tpm_spec(keytype: PublicKeyType) -> Result<Self> {
+        use fdo_data_formats::tpm::{self, key, nv, policy};
+
+        let mut ctx = tpm::open_context().context("Error opening TPM context")?;
+        let use_platform = false; // Linux userspace: Platform hierarchy locked
+
+        // Step 1: Cleanup any prior FDO state
+        nv::cleanup_fdo_state(&mut ctx, use_platform);
+        log::info!("Cleaned up prior FDO TPM state");
+
+        // Step 2: Determine curve parameters
+        let (curve, hash_alg, coord_size) = match keytype {
+            PublicKeyType::SECP256R1 => (
+                tss_esapi::interface_types::ecc::EccCurve::NistP256,
+                tss_esapi::interface_types::algorithm::HashingAlgorithm::Sha256,
+                32usize,
+            ),
+            PublicKeyType::SECP384R1 => (
+                tss_esapi::interface_types::ecc::EccCurve::NistP384,
+                tss_esapi::interface_types::algorithm::HashingAlgorithm::Sha384,
+                48usize,
+            ),
+            _ => bail!("Unsupported key type for spec TPM: {:?}", keytype),
+        };
+
+        // Step 3: Generate random unique strings
+        let dk_us_size = coord_size * 2; // X + Y
+        let mut device_key_us = vec![0u8; dk_us_size];
+        openssl::rand::rand_bytes(&mut device_key_us)
+            .context("Error generating device key unique string")?;
+        let mut hmac_us = [0u8; 32];
+        openssl::rand::rand_bytes(&mut hmac_us).context("Error generating HMAC unique string")?;
+
+        // Step 4: Define + write DeviceKey_US NV (Profile B)
+        let dk_us_handle = nv::define_nv_space(
+            &mut ctx,
+            tpm::DEVICE_KEY_US_INDEX,
+            dk_us_size,
+            tpm::NvProfile::B,
+            use_platform,
+        )
+        .context("Error defining DeviceKey_US NV")?;
+        nv::write_nv(&mut ctx, dk_us_handle, &device_key_us, tpm::NvProfile::B)
+            .context("Error writing DeviceKey_US NV")?;
+        log::debug!("Wrote DeviceKey_US NV ({} bytes)", dk_us_size);
+
+        // Compute DAK auth policy AFTER writing (NV Name now includes WRITTEN flag).
+        // Both the trial session and runtime sessions see the same NV state.
+        let dk_policy = policy::compute_fdo_auth_policy(&mut ctx, dk_us_handle)
+            .context("Error computing DAK auth policy")?;
+        log::debug!("Computed DAK auth policy digest (after NV write)");
+
+        // Step 5: Define + write HMAC_US NV (Profile B)
+        let hmac_us_handle = nv::define_nv_space(
+            &mut ctx,
+            tpm::HMAC_US_INDEX,
+            32,
+            tpm::NvProfile::B,
+            use_platform,
+        )
+        .context("Error defining HMAC_US NV")?;
+        nv::write_nv(&mut ctx, hmac_us_handle, &hmac_us, tpm::NvProfile::B)
+            .context("Error writing HMAC_US NV")?;
+        log::debug!("Wrote HMAC_US NV (32 bytes)");
+
+        // Compute HMAC key auth policy AFTER writing
+        let hmac_policy = policy::compute_fdo_auth_policy(&mut ctx, hmac_us_handle)
+            .context("Error computing HMAC key auth policy")?;
+        log::debug!("Computed HMAC key auth policy digest (after NV write)");
+
+        // Step 7: Create ECC signing key (DAK) with auth policy + persist
+        let (dak_transient, public_bytes) =
+            key::generate_spec_ec_key(&mut ctx, curve, hash_alg, &device_key_us, Some(&dk_policy))
+                .context("Error creating spec ECC key")?;
+        key::persist_key(&mut ctx, dak_transient, tpm::DAK_HANDLE)
+            .context("Error persisting DAK")?;
+        log::info!(
+            "DAK persisted to 0x{:08X} (userWithAuth=false)",
+            tpm::DAK_HANDLE
+        );
+
+        // Step 8: Create HMAC key with auth policy + persist
+        let hmac_transient = key::generate_spec_hmac_key(&mut ctx, &hmac_us, Some(&hmac_policy))
+            .context("Error creating spec HMAC key")?;
+        key::persist_key(&mut ctx, hmac_transient, tpm::HMAC_KEY_HANDLE)
+            .context("Error persisting HMAC key")?;
+        log::info!(
+            "HMAC key persisted to 0x{:08X} (userWithAuth=false)",
+            tpm::HMAC_KEY_HANDLE
+        );
+
+        // Step 8: Define DCActive NV (Profile A), write 0x00 (DI in progress)
+        let dc_active_handle = nv::define_nv_space(
+            &mut ctx,
+            tpm::DC_ACTIVE_INDEX,
+            1,
+            tpm::NvProfile::A,
+            use_platform,
+        )
+        .context("Error defining DCActive NV")?;
+        nv::write_nv(&mut ctx, dc_active_handle, &[0x00], tpm::NvProfile::A)
+            .context("Error writing DCActive NV")?;
+        log::debug!("DCActive set to 0x00 (DI in progress)");
+
+        // Step 9: Load persistent handles for use during DI protocol
+        let dak_handle = key::load_persistent_signing_key(&mut ctx, tpm::DAK_HANDLE)
+            .context("Error loading persistent DAK")?;
+        let hmac_handle = key::load_persistent_signing_key(&mut ctx, tpm::HMAC_KEY_HANDLE)
+            .context("Error loading persistent HMAC key")?;
+
+        Ok(KeyReference::SpecTpm {
+            tss_context: Box::new(ctx),
+            dak_handle,
+            hmac_handle,
+            public_bytes,
+            use_platform,
+            dk_us_nv_handle: dk_us_handle,
+            hmac_us_nv_handle: hmac_us_handle,
+        })
+    }
+
     async fn get_new_key(
         keytype: PublicKeyType,
         allowed_storage_types: Option<&[KeyStorageType]>,
@@ -856,6 +1142,7 @@ impl KeyReference {
         for key_storage_type in allowed_storage_types {
             #[allow(clippy::single_match)]
             match *key_storage_type {
+                #[cfg(feature = "tpm_support")]
                 KeyStorageType::Tpm => match KeyReference::get_new_key_tpm(keytype).await {
                     Ok(keyref) => return Ok(keyref),
                     Err(e) => {
@@ -863,6 +1150,11 @@ impl KeyReference {
                         continue;
                     }
                 },
+                #[cfg(not(feature = "tpm_support"))]
+                KeyStorageType::Tpm => {
+                    log::warn!("TPM key storage requested but tpm_support feature is not enabled");
+                    continue;
+                }
                 KeyStorageType::FileSystem => {
                     match KeyReference::get_new_key_filesystem(keytype).await {
                         Ok(keyref) => return Ok(keyref),
@@ -903,6 +1195,21 @@ impl KeyReference {
 
         match key_storage_type {
             KeyStorageType::FileSystem => KeyReference::env_key_filesystem().await,
+            #[cfg(feature = "tpm_support")]
+            KeyStorageType::Tpm => {
+                // Try P-256 first (most broadly supported), fall back to P-384
+                match KeyReference::get_new_key_tpm_spec(PublicKeyType::SECP256R1).await {
+                    Ok(keyref) => Ok(keyref),
+                    Err(e) => {
+                        log::info!("P-256 TPM key creation failed ({e:#}), trying P-384");
+                        KeyReference::get_new_key_tpm_spec(PublicKeyType::SECP384R1).await
+                    }
+                }
+            }
+            #[cfg(not(feature = "tpm_support"))]
+            KeyStorageType::Tpm => {
+                bail!("TPM support not compiled in (enable tpm_support feature)")
+            }
             _ => bail!(format!("Unsupported key storage type {key_storage_type:?}")),
         }
     }
@@ -911,6 +1218,21 @@ impl KeyReference {
         let key_storage_type = KeyStorageType::from_str(&key).context("Invalid sroage type")?;
         match key_storage_type {
             KeyStorageType::FileSystem => KeyReference::env_key_filesystem().await,
+            #[cfg(feature = "tpm_support")]
+            KeyStorageType::Tpm => {
+                // Use spec-compliant NV-based TPM storage
+                match KeyReference::get_new_key_tpm_spec(PublicKeyType::SECP256R1).await {
+                    Ok(keyref) => Ok(keyref),
+                    Err(e) => {
+                        log::info!("P-256 TPM key creation failed ({e:#}), trying P-384");
+                        KeyReference::get_new_key_tpm_spec(PublicKeyType::SECP384R1).await
+                    }
+                }
+            }
+            #[cfg(not(feature = "tpm_support"))]
+            KeyStorageType::Tpm => {
+                bail!("TPM support not compiled in (enable tpm_support feature)")
+            }
             _ => bail!(format!("Unsupported key storage type {key_storage_type:?}")),
         }
     }
@@ -920,6 +1242,7 @@ impl KeyReference {
             KeyReference::FileSystem { sign_key, .. } => sign_key
                 .public_key_to_der()
                 .context("Error serializing public key"),
+            #[cfg(feature = "tpm_support")]
             KeyReference::SemiTpm { signing_public, .. } => {
                 let signing_public = tss_esapi::structures::Public::unmarshall(signing_public)
                     .context("Error unmarshalling Public")?;
@@ -966,13 +1289,21 @@ impl KeyReference {
                     _ => bail!("Unsupported signing key type"),
                 }
             }
+            #[cfg(feature = "tpm_support")]
+            KeyReference::SpecTpm { public_bytes, .. } => {
+                fdo_data_formats::tpm::key::public_key_to_der(public_bytes)
+                    .context("Error extracting public key from TPM")
+            }
         }
     }
 
     fn get_public_key_storage_type(&self) -> KeyStorageType {
         match self {
             KeyReference::FileSystem { .. } => KeyStorageType::FileSystem,
+            #[cfg(feature = "tpm_support")]
             KeyReference::SemiTpm { .. } => KeyStorageType::Tpm,
+            #[cfg(feature = "tpm_support")]
+            KeyReference::SpecTpm { .. } => KeyStorageType::Tpm,
         }
     }
 
@@ -994,9 +1325,43 @@ impl KeyReference {
                 },
                 _ => bail!("Unsupported key type"),
             },
-            KeyReference::SemiTpm { .. } => {
-                // TPM keys are always SECP384R1 in this implementation
-                Ok(PublicKeyType::SECP384R1)
+            #[cfg(feature = "tpm_support")]
+            KeyReference::SemiTpm { signing_public, .. } => {
+                let signing_public = tss_esapi::structures::Public::unmarshall(signing_public)
+                    .context("Error unmarshalling signing public key")?;
+                match signing_public {
+                    tss_esapi::structures::Public::Ecc { parameters, .. } => {
+                        match parameters.ecc_curve() {
+                            tss_esapi::interface_types::ecc::EccCurve::NistP256 => {
+                                Ok(PublicKeyType::SECP256R1)
+                            }
+                            tss_esapi::interface_types::ecc::EccCurve::NistP384 => {
+                                Ok(PublicKeyType::SECP384R1)
+                            }
+                            _ => bail!("Unsupported TPM ECC curve"),
+                        }
+                    }
+                    _ => bail!("Unsupported TPM key type"),
+                }
+            }
+            #[cfg(feature = "tpm_support")]
+            KeyReference::SpecTpm { public_bytes, .. } => {
+                let signing_public = tss_esapi::structures::Public::unmarshall(public_bytes)
+                    .context("Error unmarshalling spec TPM public key")?;
+                match signing_public {
+                    tss_esapi::structures::Public::Ecc { parameters, .. } => {
+                        match parameters.ecc_curve() {
+                            tss_esapi::interface_types::ecc::EccCurve::NistP256 => {
+                                Ok(PublicKeyType::SECP256R1)
+                            }
+                            tss_esapi::interface_types::ecc::EccCurve::NistP384 => {
+                                Ok(PublicKeyType::SECP384R1)
+                            }
+                            _ => bail!("Unsupported TPM ECC curve"),
+                        }
+                    }
+                    _ => bail!("Unsupported TPM key type"),
+                }
             }
         }
     }
@@ -1005,7 +1370,7 @@ impl KeyReference {
     /// Returns DER-encoded CSR bytes.
     /// The Go server validates the CSR signature, so it must be self-signed
     /// with the device's signing key.
-    fn generate_csr(&self) -> Result<Vec<u8>> {
+    fn generate_csr(&mut self) -> Result<Vec<u8>> {
         match self {
             KeyReference::FileSystem { sign_key, .. } => {
                 let mut name_builder =
@@ -1044,8 +1409,233 @@ impl KeyReference {
                 let req = req_builder.build();
                 req.to_der().context("Error converting CSR to DER")
             }
-            KeyReference::SemiTpm { .. } => {
-                bail!("CSR generation not yet supported for TPM keys")
+            #[cfg(feature = "tpm_support")]
+            KeyReference::SemiTpm {
+                ref mut tss_context,
+                primary_handle,
+                signing_public,
+                signing_private,
+                ..
+            } => {
+                // For TPM keys, we need to:
+                // 1. Build the CSR with the public key
+                // 2. Sign the TBS (to-be-signed) portion with the TPM
+                //
+                // Extract the public key as an OpenSSL PKey for CSR construction
+                let signing_pub = tss_esapi::structures::Public::unmarshall(signing_public)
+                    .context("Error unmarshalling signing public key")?;
+
+                let (pkey, digest, _hash_algo) = match &signing_pub {
+                    tss_esapi::structures::Public::Ecc {
+                        parameters, unique, ..
+                    } => {
+                        let (curve_nid, digest, hash_algo) = match parameters.ecc_curve() {
+                            tss_esapi::interface_types::ecc::EccCurve::NistP256 => (
+                                Nid::X9_62_PRIME256V1,
+                                MessageDigest::sha256(),
+                                tss_esapi::interface_types::algorithm::HashingAlgorithm::Sha256,
+                            ),
+                            tss_esapi::interface_types::ecc::EccCurve::NistP384 => (
+                                Nid::SECP384R1,
+                                MessageDigest::sha384(),
+                                tss_esapi::interface_types::algorithm::HashingAlgorithm::Sha384,
+                            ),
+                            _ => bail!("Unsupported TPM ECC curve for CSR generation"),
+                        };
+                        let group = EcGroup::from_curve_name(curve_nid)
+                            .context("Error creating EC group")?;
+                        let x = BigNum::from_slice(unique.x())
+                            .context("Error converting X coordinate")?;
+                        let y = BigNum::from_slice(unique.y())
+                            .context("Error converting Y coordinate")?;
+                        let ec_key = EcKey::from_public_key_affine_coordinates(&group, &x, &y)
+                            .context("Error creating EC public key")?;
+                        let pkey = PKey::from_ec_key(ec_key).context("Error converting to PKey")?;
+                        (pkey, digest, hash_algo)
+                    }
+                    _ => bail!("Unsupported TPM key type for CSR generation"),
+                };
+
+                // Build CSR structure with public key (unsigned)
+                let mut name_builder =
+                    X509NameBuilder::new().context("Error creating X509 name builder")?;
+                name_builder
+                    .append_entry_by_text("CN", "device.fdo-rs")
+                    .context("Error setting CSR subject CN")?;
+                let name = name_builder.build();
+
+                let mut req_builder =
+                    X509ReqBuilder::new().context("Error creating X509 request builder")?;
+                req_builder
+                    .set_subject_name(&name)
+                    .context("Error setting CSR subject name")?;
+                req_builder
+                    .set_pubkey(&pkey)
+                    .context("Error setting CSR public key")?;
+
+                // Get the TBS (to-be-signed) data by signing with a dummy,
+                // then we'll extract the TBS bytes and re-sign with TPM.
+                // Unfortunately OpenSSL doesn't expose the TBS directly,
+                // so we use a different approach: build the DER manually.
+
+                // Use openssl to get the CSR info (to-be-signed) portion:
+                // We sign with a temporary key just to get the DER structure,
+                // then we'll replace the signature with the TPM signature.
+                //
+                // Alternative: use the openssl CSR but with a custom signer.
+                // OpenSSL 3.x doesn't make this easy, so we'll build it manually.
+
+                // Get the raw TBS data from an unsigned CSR
+                // Method: serialize the CertificationRequestInfo, hash it, sign with TPM
+                use openssl::hash::hash;
+
+                // Build CertificationRequestInfo DER bytes using openssl's internal
+                // We can get this by building a self-signed CSR and extracting the TBS
+                // Actually, the simplest approach: sign with a temp key, extract TBS, re-sign
+                let temp_key = {
+                    let ec_key = pkey.ec_key().context("Not EC key")?;
+                    let group = ec_key.group();
+                    let temp_ec = EcKey::generate(group).context("Error generating temp key")?;
+                    PKey::from_ec_key(temp_ec).context("Error creating temp PKey")?
+                };
+                req_builder
+                    .sign(&temp_key, digest)
+                    .context("Error temp-signing CSR")?;
+                let temp_csr_der = req_builder
+                    .build()
+                    .to_der()
+                    .context("Error encoding temp CSR")?;
+
+                // Parse the DER to find the TBS portion (CertificationRequestInfo)
+                // CSR DER = SEQUENCE { CertificationRequestInfo, SignatureAlgorithm, Signature }
+                // The TBS is the first element of the outer SEQUENCE
+                let tbs_bytes = extract_tbs_from_csr_der(&temp_csr_der)
+                    .context("Error extracting TBS from CSR DER")?;
+
+                // Hash the TBS
+                let tbs_hash = hash(digest, &tbs_bytes).context("Error hashing TBS")?;
+
+                // Load the signing key into TPM and sign
+                let signing_handle = tss_context
+                    .execute_with_nullauth_session(|ctx| {
+                        ctx.load(
+                            *primary_handle,
+                            signing_private.as_slice().try_into()?,
+                            signing_pub.clone(),
+                        )
+                    })
+                    .context("Error loading TPM signing key")?;
+
+                let tpm_digest = tss_esapi::structures::Digest::try_from(tbs_hash.as_ref())
+                    .context("Error creating TPM digest")?;
+                let validation: tss_esapi::structures::HashcheckTicket =
+                    tss_esapi::tss2_esys::TPMT_TK_HASHCHECK {
+                        tag: tss_esapi::constants::tss::TPM2_ST_HASHCHECK,
+                        hierarchy: tss_esapi::constants::tss::TPM2_RH_NULL,
+                        digest: Default::default(),
+                    }
+                    .try_into()
+                    .context("Error creating validation ticket")?;
+
+                let signature = tss_context
+                    .execute_with_nullauth_session(|ctx| {
+                        ctx.sign(
+                            signing_handle,
+                            tpm_digest,
+                            tss_esapi::structures::SignatureScheme::Null,
+                            validation,
+                        )
+                    })
+                    .context("Error signing CSR with TPM")?;
+
+                // Flush the signing key
+                tss_context
+                    .execute_with_nullauth_session(|ctx| ctx.flush_context(signing_handle.into()))
+                    .context("Error flushing signing key")?;
+
+                // Convert TPM ECDSA signature to DER
+                let sig_der = match signature {
+                    tss_esapi::structures::Signature::EcDsa(sig) => {
+                        ecdsa_sig_to_der(sig.signature_r().value(), sig.signature_s().value())
+                            .context("Error converting ECDSA signature to DER")?
+                    }
+                    _ => bail!("Unexpected TPM signature type"),
+                };
+
+                // Reassemble the CSR DER with the TPM signature
+                let csr_der = assemble_csr_der(&tbs_bytes, &sig_der, &signing_pub)
+                    .context("Error assembling CSR with TPM signature")?;
+
+                Ok(csr_der)
+            }
+            #[cfg(feature = "tpm_support")]
+            KeyReference::SpecTpm {
+                ref mut tss_context,
+                dak_handle,
+                public_bytes,
+                dk_us_nv_handle,
+                ..
+            } => {
+                let signing_pub = tss_esapi::structures::Public::unmarshall(public_bytes)
+                    .context("Error unmarshalling spec TPM public key")?;
+
+                let (pkey, digest) = match &signing_pub {
+                    tss_esapi::structures::Public::Ecc {
+                        parameters, unique, ..
+                    } => {
+                        let (curve_nid, digest) = match parameters.ecc_curve() {
+                            tss_esapi::interface_types::ecc::EccCurve::NistP256 => {
+                                (Nid::X9_62_PRIME256V1, MessageDigest::sha256())
+                            }
+                            tss_esapi::interface_types::ecc::EccCurve::NistP384 => {
+                                (Nid::SECP384R1, MessageDigest::sha384())
+                            }
+                            _ => bail!("Unsupported curve for CSR"),
+                        };
+                        let group = EcGroup::from_curve_name(curve_nid)?;
+                        let x = BigNum::from_slice(unique.x())?;
+                        let y = BigNum::from_slice(unique.y())?;
+                        let ec_key = EcKey::from_public_key_affine_coordinates(&group, &x, &y)?;
+                        let pkey = PKey::from_ec_key(ec_key)?;
+                        (pkey, digest)
+                    }
+                    _ => bail!("Unsupported key type for CSR"),
+                };
+
+                let mut name_builder = X509NameBuilder::new()?;
+                name_builder.append_entry_by_text("CN", "device.fdo-rs")?;
+                let name = name_builder.build();
+
+                let mut req_builder = X509ReqBuilder::new()?;
+                req_builder.set_subject_name(&name)?;
+                req_builder.set_pubkey(&pkey)?;
+
+                // Sign with a temp key to get TBS structure
+                let temp_key = {
+                    let ec_key = pkey.ec_key()?;
+                    let temp_ec = EcKey::generate(ec_key.group())?;
+                    PKey::from_ec_key(temp_ec)?
+                };
+                req_builder.sign(&temp_key, digest)?;
+                let temp_csr_der = req_builder.build().to_der()?;
+
+                let tbs_bytes =
+                    extract_tbs_from_csr_der(&temp_csr_der).context("Error extracting TBS")?;
+
+                use openssl::hash::hash;
+                let tbs_hash = hash(digest, &tbs_bytes)?;
+
+                // Sign with persistent DAK using policy session via second ESYS connection
+                let (r, s) = fdo_data_formats::tpm::policy::sign_with_policy(
+                    fdo_data_formats::tpm::DEVICE_KEY_US_INDEX,
+                    fdo_data_formats::tpm::DAK_HANDLE,
+                    tbs_hash.as_ref(),
+                )
+                .context("Error signing CSR with TPM DAK")?;
+
+                let sig_der = ecdsa_sig_to_der(&r, &s)?;
+
+                assemble_csr_der(&tbs_bytes, &sig_der, &signing_pub).context("Error assembling CSR")
             }
         }
     }
@@ -1089,6 +1679,7 @@ impl KeyReference {
 
                 fs::write(filename, cred).context("Error writing device credential")
             }
+            #[cfg(feature = "tpm_support")]
             KeyReference::SemiTpm {
                 signing_public,
                 signing_private,
@@ -1123,6 +1714,139 @@ impl KeyReference {
 
                 fs::write(filename, cred).context("Error writing device credential")
             }
+            #[cfg(feature = "tpm_support")]
+            KeyReference::SpecTpm {
+                mut tss_context,
+                use_platform,
+                public_bytes,
+                ..
+            } => {
+                use fdo_data_formats::tpm::{self, nv};
+
+                // Write DCTPM NV: GUID (16 bytes) + DeviceInfo string
+                // Guid serialization: extract raw bytes via CBOR roundtrip
+                let guid_bytes = guid.serialize_data().context("Error serializing GUID")?;
+                // The CBOR-encoded GUID is a bstr; for NV we need raw 16 bytes.
+                // Use the serialized form directly (Go uses raw GUID bytes).
+                // Actually the Guid inner data is a Vec<u8> of 16 bytes.
+                // We can serialize to CBOR and extract, or just use the serialized GUID.
+                // For interop with Go: DCTPM = raw GUID (16 bytes) + DeviceInfo string.
+                // Let's extract the inner bytes by serializing to CBOR bstr and unwrapping.
+                let guid_raw: Vec<u8> = {
+                    let mut buf = Vec::new();
+                    ciborium::ser::into_writer(&guid, &mut buf)
+                        .context("Error CBOR-encoding GUID")?;
+                    // CBOR bstr: major type 2 + 16 bytes = [0x50, ...16 bytes...]
+                    if buf.len() >= 17 && buf[0] == 0x50 {
+                        buf[1..17].to_vec()
+                    } else {
+                        // Fallback: use the serialized data directly
+                        guid_bytes
+                    }
+                };
+                let mut dctpm_data = Vec::with_capacity(16 + device_info.len());
+                dctpm_data.extend_from_slice(&guid_raw[..std::cmp::min(guid_raw.len(), 16)]);
+                // Pad to 16 if shorter
+                while dctpm_data.len() < 16 {
+                    dctpm_data.push(0);
+                }
+                dctpm_data.extend_from_slice(device_info.as_bytes());
+
+                let dctpm_handle = nv::define_nv_space(
+                    &mut tss_context,
+                    tpm::DCTPM_INDEX,
+                    dctpm_data.len(),
+                    tpm::NvProfile::B,
+                    use_platform,
+                )
+                .context("Error defining DCTPM NV")?;
+                nv::write_nv(
+                    &mut tss_context,
+                    dctpm_handle,
+                    &dctpm_data,
+                    tpm::NvProfile::B,
+                )
+                .context("Error writing DCTPM NV")?;
+                log::info!(
+                    "Wrote DCTPM NV ({} bytes): GUID + DeviceInfo",
+                    dctpm_data.len()
+                );
+
+                // Write DCOV NV: CBOR array matching Go's dcovNVData encoding.
+                // Go encodes dcovNVData as CBOR array (not map): [version, rvinfo, pubkeyhash, keytype]
+                // Each element uses the FDO protocol's native CBOR encoding.
+                let key_type_value: u8 = {
+                    // Derive key type from public bytes
+                    let pub_struct = tss_esapi::structures::Public::unmarshall(&public_bytes)
+                        .context("Error unmarshalling public for key type")?;
+                    match pub_struct {
+                        tss_esapi::structures::Public::Ecc { parameters, .. } => {
+                            match parameters.ecc_curve() {
+                                tss_esapi::interface_types::ecc::EccCurve::NistP256 => 10, // SECP256R1
+                                tss_esapi::interface_types::ecc::EccCurve::NistP384 => 11, // SECP384R1
+                                _ => 0,
+                            }
+                        }
+                        _ => 0,
+                    }
+                };
+
+                // Serialize each field to its CBOR representation, then wrap in array
+                let mut dcov_payload = Vec::new();
+                {
+                    // We need to produce: CBOR array [version, rvinfo, pubkeyhash, keytype]
+                    // Use serde_cbor's Value to build the array with correctly-typed elements
+                    let version_val = serde_cbor::Value::Integer(protocol_version as i128);
+                    let rvinfo_val = serde_cbor::value::to_value(&rvinfo)
+                        .unwrap_or(serde_cbor::Value::Array(vec![]));
+                    let hash_val = serde_cbor::value::to_value(&manufacturer_public_key_hash)
+                        .unwrap_or(serde_cbor::Value::Null);
+                    let keytype_val = serde_cbor::Value::Integer(key_type_value as i128);
+
+                    let dcov_array = serde_cbor::Value::Array(vec![
+                        version_val,
+                        rvinfo_val,
+                        hash_val,
+                        keytype_val,
+                    ]);
+                    dcov_payload = serde_cbor::to_vec(&dcov_array)
+                        .context("Error encoding DCOV CBOR array")?;
+                }
+
+                let dcov_handle = nv::define_nv_space(
+                    &mut tss_context,
+                    tpm::DCOV_INDEX,
+                    dcov_payload.len(),
+                    tpm::NvProfile::C,
+                    use_platform,
+                )
+                .context("Error defining DCOV NV")?;
+                nv::write_nv(
+                    &mut tss_context,
+                    dcov_handle,
+                    &dcov_payload,
+                    tpm::NvProfile::C,
+                )
+                .context("Error writing DCOV NV")?;
+                log::info!("Wrote DCOV NV ({} bytes)", dcov_payload.len());
+
+                // Update DCActive to 0x01 (device initialized)
+                if let Ok((_, _, dc_active_handle)) =
+                    nv::read_nv_public(&mut tss_context, tpm::DC_ACTIVE_INDEX)
+                {
+                    nv::write_nv(
+                        &mut tss_context,
+                        dc_active_handle,
+                        &[0x01],
+                        tpm::NvProfile::A,
+                    )
+                    .context("Error updating DCActive to 0x01")?;
+                }
+                log::info!("DCActive set to 0x01 (device initialized)");
+                log::info!("Credentials stored in TPM NV indices (no file written)");
+
+                Ok(())
+            }
         }
     }
 
@@ -1142,6 +1866,7 @@ impl KeyReference {
                 HMac::from_digest(HashType::HmacSha384, hmac)
                     .context("Error converting result to hmac")
             }
+            #[cfg(feature = "tpm_support")]
             KeyReference::SemiTpm {
                 ref mut tss_context,
                 primary_handle,
@@ -1206,6 +1931,18 @@ impl KeyReference {
                     .context("Error computing hmac")?;
                 HMac::from_digest(hash_type, hmac.to_vec())
                     .context("Error converting result to hmac")
+            }
+            #[cfg(feature = "tpm_support")]
+            KeyReference::SpecTpm { .. } => {
+                // Use persistent HMAC key with policy session via second ESYS connection
+                let hmac_bytes = fdo_data_formats::tpm::policy::hmac_with_policy(
+                    fdo_data_formats::tpm::HMAC_US_INDEX,
+                    fdo_data_formats::tpm::HMAC_KEY_HANDLE,
+                    data,
+                )
+                .context("Error computing HMAC with TPM policy session")?;
+                HMac::from_digest(HashType::HmacSha256, hmac_bytes)
+                    .context("Error creating HMac from TPM HMAC")
             }
         }
     }

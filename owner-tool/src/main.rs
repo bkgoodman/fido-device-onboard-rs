@@ -21,6 +21,7 @@ use openssl::{
 };
 use serde_yaml::Value;
 use std::fs::File;
+#[cfg(feature = "tpm_support")]
 use tss_esapi::{structures::Public as TssPublic, traits::UnMarshall};
 
 use fdo_data_formats::{
@@ -561,6 +562,7 @@ fn dump_devcred(args: &DumpDeviceCredentialArguments) -> Result<(), Error> {
             println!("\tHMAC key: <secret>");
             println!("\tSigning key: <secret>");
         }
+        #[cfg(feature = "tpm_support")]
         fdo_data_formats::devicecredential::file::KeyStorage::Tpm {
             signing_public,
             hmac_public,
@@ -573,6 +575,10 @@ fn dump_devcred(args: &DumpDeviceCredentialArguments) -> Result<(), Error> {
 
             println!("\tHMAC key TPM public: {hmac_public:?}");
             println!("\tSigning key TPM public: {signing_public:?}");
+        }
+        #[cfg(not(feature = "tpm_support"))]
+        fdo_data_formats::devicecredential::file::KeyStorage::Tpm { .. } => {
+            println!("\tTPM credential (tpm_support feature not enabled)");
         }
     }
 
