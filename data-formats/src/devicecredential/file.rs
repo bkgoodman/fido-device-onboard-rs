@@ -1,7 +1,5 @@
-use std::{
-    cell::RefCell,
-    convert::{TryFrom, TryInto},
-};
+#[cfg(feature = "tpm_support")]
+use std::convert::TryInto;
 
 use crate::{
     constants::HashType,
@@ -11,12 +9,17 @@ use crate::{
     DeviceCredential, ProtocolVersion,
 };
 
+#[cfg(feature = "tpm_support")]
 use aws_nitro_enclaves_cose::{
     crypto::MessageDigest, crypto::SignatureAlgorithm, error::CoseError,
 };
 use openssl::{pkey::PKey, sign::Signer};
 use serde::{Deserialize, Serialize};
 use serde_tuple::Serialize_tuple;
+
+#[cfg(feature = "tpm_support")]
+use std::{cell::RefCell, convert::TryFrom};
+#[cfg(feature = "tpm_support")]
 use tss_esapi::{
     attributes::ObjectAttributesBuilder, structures::PublicBuilder, traits::UnMarshall,
 };
@@ -35,6 +38,7 @@ pub enum KeyStorage {
     },
 }
 
+#[cfg(feature = "tpm_support")]
 fn get_semi_tpm_ctx_and_primary(
 ) -> Result<(tss_esapi::Context, tss_esapi::handles::KeyHandle), Error> {
     let tcti_conf = tss_esapi::tcti_ldr::TctiNameConf::from_environment_variable()
@@ -69,6 +73,7 @@ impl KeyStorage {
                 let ov_hmac = hmac_signer.sign_to_vec()?;
                 HMac::from_digest(hmac_type, ov_hmac)
             }
+            #[cfg(feature = "tpm_support")]
             KeyStorage::Tpm {
                 hmac_public,
                 hmac_private,
@@ -126,10 +131,15 @@ impl KeyStorage {
                 })?;
                 Ok(HMac::from_digest(hash_type, hmac.to_vec())?)
             }
+            #[cfg(not(feature = "tpm_support"))]
+            KeyStorage::Tpm { .. } => Err(Error::NotImplemented(
+                "TPM credential loaded but tpm_support feature is not enabled",
+            )),
         }
     }
 }
 
+#[cfg(feature = "tpm_support")]
 pub fn semi_tpm_primary_key_template() -> Result<tss_esapi::structures::Public, Error> {
     let primary_attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
@@ -211,6 +221,7 @@ impl DeviceCredential for FileDeviceCredential {
             KeyStorage::Plain {
                 ref private_key, ..
             } => Ok(Box::new(PKey::private_key_from_der(private_key)?)),
+            #[cfg(feature = "tpm_support")]
             KeyStorage::Tpm {
                 ref signing_public,
                 ref signing_private,
@@ -234,10 +245,15 @@ impl DeviceCredential for FileDeviceCredential {
                     signing_public,
                 }))
             }
+            #[cfg(not(feature = "tpm_support"))]
+            KeyStorage::Tpm { .. } => Err(Error::NotImplemented(
+                "TPM credential loaded but tpm_support feature is not enabled",
+            )),
         }
     }
 }
 
+#[cfg(feature = "tpm_support")]
 struct TpmCoseSigner {
     tss_context: RefCell<tss_esapi::Context>,
     // This is here for the lifetime of the KeyHandle, so it won't be dropped
@@ -246,6 +262,7 @@ struct TpmCoseSigner {
     signing_public: tss_esapi::structures::Public,
 }
 
+#[cfg(feature = "tpm_support")]
 impl TpmCoseSigner {
     fn public_to_parameters(
         public: &tss_esapi::structures::Public,
@@ -314,6 +331,7 @@ impl TpmCoseSigner {
     }
 }
 
+#[cfg(feature = "tpm_support")]
 impl aws_nitro_enclaves_cose::crypto::SigningPublicKey for TpmCoseSigner {
     fn get_parameters(&self) -> Result<(SignatureAlgorithm, MessageDigest), CoseError> {
         Ok(TpmCoseSigner::public_to_parameters(&self.signing_public)?.0)
@@ -325,6 +343,7 @@ impl aws_nitro_enclaves_cose::crypto::SigningPublicKey for TpmCoseSigner {
     }
 }
 
+#[cfg(feature = "tpm_support")]
 fn merge_ec_signature(bytes_r: &[u8], bytes_s: &[u8], key_length: usize) -> Vec<u8> {
     assert!(bytes_r.len() <= key_length);
     assert!(bytes_s.len() <= key_length);
@@ -344,6 +363,7 @@ fn merge_ec_signature(bytes_r: &[u8], bytes_s: &[u8], key_length: usize) -> Vec<
     signature_bytes
 }
 
+#[cfg(feature = "tpm_support")]
 impl aws_nitro_enclaves_cose::crypto::SigningPrivateKey for TpmCoseSigner {
     fn sign(&self, digest: &[u8]) -> Result<Vec<u8>, CoseError> {
         let key_length = Self::public_to_parameters(&self.signing_public)?.2;

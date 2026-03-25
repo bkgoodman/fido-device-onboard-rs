@@ -19,6 +19,9 @@ pub mod messages;
 
 pub mod cborparser;
 
+#[cfg(feature = "tpm_support")]
+pub mod tpm;
+
 mod serializable;
 pub use serializable::DeserializableMany;
 pub use serializable::Serializable;

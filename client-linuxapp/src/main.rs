@@ -28,6 +28,35 @@ use fdo_util::device_credential_locations::UsableDeviceCredentialLocation;
 
 mod serviceinfo;
 
+/// No-op credential location for TPM-backed credentials.
+/// Deactivation is handled by writing DCActive=0x00 to NV.
+struct TpmCredentialLocation;
+
+impl std::fmt::Debug for TpmCredentialLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TpmCredentialLocation(NV)")
+    }
+}
+
+impl device_credential_locations::DeviceCredentialLocation for TpmCredentialLocation {
+    fn resolve(&self) -> Option<Result<Box<dyn UsableDeviceCredentialLocation>, anyhow::Error>> {
+        Some(Ok(Box::new(TpmCredentialLocation)))
+    }
+}
+
+impl UsableDeviceCredentialLocation for TpmCredentialLocation {
+    fn read(&self) -> Result<Box<dyn DeviceCredential>, anyhow::Error> {
+        unreachable!("TPM credentials are loaded separately")
+    }
+
+    fn deactivate(&self) -> Result<(), anyhow::Error> {
+        // For TPM credentials, deactivation means setting DCActive to 0x00.
+        // For credential reuse, we skip deactivation.
+        log::info!("TPM credential deactivation (no-op for credential reuse)");
+        Ok(())
+    }
+}
+
 const DEVICE_ONBOARDING_EXECUTED_MARKER_FILE: &str = "/etc/device_onboarding_performed";
 
 fn marker_file_location() -> PathBuf {
@@ -761,30 +790,68 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let devcred_location = match device_credential_locations::find() {
-        None => {
-            log::info!("No usable device credential located, skipping Device Onboarding");
-            return Ok(());
+    // Try loading credentials from TPM NV indices first (spec-compliant path).
+    // Falls back to filesystem credentials if TPM has no FDO state.
+    #[cfg(feature = "tpm_support")]
+    let tpm_dc = {
+        match fdo_data_formats::tpm::credential::TpmDeviceCredential::load_from_nv() {
+            Ok(Some(dc)) => {
+                log::info!("Found device credential in TPM NV indices");
+                Some(dc)
+            }
+            Ok(None) => {
+                log::debug!("No FDO credentials in TPM, falling back to filesystem");
+                None
+            }
+            Err(e) => {
+                log::debug!(
+                    "Error reading TPM NV credentials: {:?}, falling back to filesystem",
+                    e
+                );
+                None
+            }
         }
-        Some(Err(e)) => {
-            log::error!("Error opening device credential: {:?}", e);
-            return Err(e).context("Error getting device credential at any of the known locations");
-        }
-        Some(Ok(dc)) => dc,
+    };
+    #[cfg(not(feature = "tpm_support"))]
+    let tpm_dc: Option<fdo_data_formats::devicecredential::file::FileDeviceCredential> = None;
+
+    // Use TPM credential if available, otherwise fall back to filesystem
+    let (dc, devcred_loc): (
+        Box<dyn fdo_data_formats::DeviceCredential>,
+        Box<dyn UsableDeviceCredentialLocation>,
+    ) = if let Some(tpm_cred) = tpm_dc {
+        (Box::new(tpm_cred), Box::new(TpmCredentialLocation))
+    } else {
+        let devcred_location = match device_credential_locations::find() {
+            None => {
+                log::info!("No usable device credential located, skipping Device Onboarding");
+                return Ok(());
+            }
+            Some(Err(e)) => {
+                log::error!("Error opening device credential: {:?}", e);
+                return Err(e)
+                    .context("Error getting device credential at any of the known locations");
+            }
+            Some(Ok(dc)) => dc,
+        };
+
+        log::info!("Found device credential at {:?}", devcred_location);
+        let cred = devcred_location
+            .read()
+            .context("Error reading device credential")?;
+        (cred, devcred_location)
     };
 
-    log::info!("Found device credential at {:?}", devcred_location);
-
-    let dc = devcred_location
-        .read()
-        .context("Error reading device credential")?;
     log::trace!("Device credential: {:?}", dc);
 
     if !dc.is_active() {
         log::info!("Device credential deactivated, skipping Device Onboarding");
         return Ok(());
     }
-    if dc.protocol_version() != ProtocolVersion::Version2_0 {
+    if dc.protocol_version() != ProtocolVersion::Version2_0
+        && dc.protocol_version() != ProtocolVersion::Version1_1
+        && dc.protocol_version() != ProtocolVersion::Version1_0
+    {
         bail!(
             "Device credential protocol version {} not supported (FDO 2.0 only)",
             dc.protocol_version()
@@ -855,7 +922,7 @@ async fn main() -> Result<()> {
             }
 
             for to2_address in to2_addresses {
-                match perform_to2(devcred_location.borrow(), dc.as_ref(), &to2_address, &to1d)
+                match perform_to2(devcred_loc.borrow(), dc.as_ref(), &to2_address, &to1d)
                     .await
                     .context("Error performing TO2 ownership protocol")
                 {

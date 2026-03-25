@@ -27,7 +27,7 @@ num-traits = "0.2"
 num-derive = "0.4"
 paste = "1.0"
 pem = "3.0"
-tss-esapi = { version = "7.6", features = ["generate-bindings"] }
+tss-esapi = { version = "7.6", optional = true }
 byteorder = "1"
 
 http = "0.2"
@@ -40,6 +40,12 @@ use_noninteroperable_kdf = []
 # Enable delegate certificate support for FDO 2.0.
 # When disabled, delegate chains in ProveOVHdr20 are ignored (owner key used directly).
 delegate_support = []
+# Enable TPM support for device credential storage.
+# When disabled, builds without tss-esapi / tpm2-tss-devel dependency.
+tpm_support = ["tss-esapi"]
+# Use generate-bindings for tss-esapi (requires libclang-dev).
+# Only needed when building against a non-standard TSS2 library version.
+tpm_generate_bindings = ["tpm_support", "tss-esapi/generate-bindings"]
 
 [build-dependencies]
 openssl-kdf = { version = "0.4.2", features = ["allow_custom"] }

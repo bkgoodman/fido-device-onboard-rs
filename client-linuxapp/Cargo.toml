@@ -30,3 +30,4 @@ fdo-util = { path = "../util", version = "0.5.5" }
 [features]
 default = ["delegate_support"]
 delegate_support = ["fdo-data-formats/delegate_support"]
+tpm_support = ["fdo-data-formats/tpm_support"]
