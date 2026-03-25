@@ -245,16 +245,21 @@ async fn perform_hellorv(
                 e,
             ))
         })?;
-    let token = COSESign::from_eat(eat, None, signer.as_ref())
-        .context("Error signing new token")
-        .map_err(|e| {
-            ClientError::Response(ErrorResult::new(
-                ErrorCode::InternalServerError,
-                "Error signing new token",
-                MessageType::TO1HelloRVAck,
-                e,
-            ))
-        })?;
+    let token = COSESign::from_eat_with_aad(
+        eat,
+        None,
+        signer.as_ref(),
+        &fdo_data_formats::cose_aad::aad_prove_to_rv(),
+    )
+    .context("Error signing new token")
+    .map_err(|e| {
+        ClientError::Response(ErrorResult::new(
+            ErrorCode::InternalServerError,
+            "Error signing new token",
+            MessageType::TO1HelloRVAck,
+            e,
+        ))
+    })?;
     Ok(token)
 }
 
@@ -492,8 +497,13 @@ async fn perform_to2(
     let signer = devcred
         .get_signer()
         .context("Error getting device signer")?;
-    let prove_device_token = COSESign::new(&prove_device_payload, None, signer.as_ref())
-        .context("Error signing ProveDevice20")?;
+    let prove_device_token = COSESign::new_with_aad(
+        &prove_device_payload,
+        None,
+        signer.as_ref(),
+        &fdo_data_formats::cose_aad::aad_prove_device(),
+    )
+    .context("Error signing ProveDevice20")?;
 
     let prove_device_msg = messages::v20::to2::ProveDevice20::new(prove_device_token);
     let prove_ov_hdr: RequestResult<messages::v20::to2::ProveOVHdr20> =
@@ -662,12 +672,18 @@ async fn perform_to2(
 
     // Verify ProveOVHdr20 COSE signature
     let _prove_ov_hdr_payload: TO2ProveOVHdr20Payload = prove_ov_hdr
-        .get_payload(signature_key)
+        .get_payload_with_aad(
+            signature_key,
+            &fdo_data_formats::cose_aad::aad_prove_ov_hdr(),
+        )
         .context("Error validating ProveOVHdr20 signature")?;
 
     // Verify TO1D was signed by current owner (always use OV owner key, not delegate)
-    to1d.verify(ov_owner_entry.public_key().pkey())
-        .context("Error validating TO1D signature")?;
+    to1d.verify_with_aad(
+        ov_owner_entry.public_key().pkey(),
+        &fdo_data_formats::cose_aad::aad_owner_sign(),
+    )
+    .context("Error validating TO1D signature")?;
 
     log::info!("Ownership voucher validated successfully");
 

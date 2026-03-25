@@ -304,7 +304,12 @@ impl OwnershipVoucher {
             OwnershipVoucherEntryPayload::new(last_hash, hdrinfo_hash, extra, next_party.clone())?;
 
         // Sign with private key
-        let signed_new_entry = COSESign::new(&new_entry, None, owner_private_key)?;
+        let signed_new_entry = COSESign::new_with_aad(
+            &new_entry,
+            None,
+            owner_private_key,
+            &crate::cose_aad::aad_ov_entry(),
+        )?;
         let signed_new_entry = OwnershipVoucherEntry::new(signed_new_entry);
 
         // Append
@@ -387,8 +392,8 @@ impl EntryIter<'_> {
         entry: OwnershipVoucherEntry,
     ) -> Result<OwnershipVoucherEntryPayload> {
         let entry_cose = entry.0;
-        let entry: OwnershipVoucherEntryPayload =
-            entry_cose.get_payload(self.last_pubkey.pkey())?;
+        let entry: OwnershipVoucherEntryPayload = entry_cose
+            .get_payload_with_aad(self.last_pubkey.pkey(), &crate::cose_aad::aad_ov_entry())?;
 
         // Compare the HashPreviousEntry to either (HeaderTag || HeaderHmac) or the previous entry
         let hash_previous_entry = if self.index == 0 {

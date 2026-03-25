@@ -19,6 +19,8 @@ pub mod messages;
 
 pub mod cborparser;
 
+pub mod cose_aad;
+
 #[cfg(feature = "tpm_support")]
 pub mod tpm;
 

@@ -2373,6 +2373,136 @@ impl COSESign {
         }
         Ok(None)
     }
+
+    // ---- AAD-aware methods ----
+    // These bypass the aws-nitro-enclaves-cose library's SigStructure (which
+    // hardcodes empty external_aad) and manually construct the COSE Sig_structure
+    // with the supplied external_aad bytes.
+
+    /// Extract the raw bytes of the protected header bstr from the COSE_Sign1 array.
+    fn extract_protected_bytes(&self) -> Result<Vec<u8>, Error> {
+        let raw = self.contents.get_raw(0);
+        let bytes: ByteBuf = serde_cbor::from_slice(raw)?;
+        Ok(bytes.into_vec())
+    }
+
+    /// Extract the raw payload bytes from the COSE_Sign1 array.
+    fn extract_payload_bytes(&self) -> Result<Vec<u8>, Error> {
+        let raw = self.contents.get_raw(2);
+        let bytes: ByteBuf = serde_cbor::from_slice(raw)?;
+        Ok(bytes.into_vec())
+    }
+
+    /// Extract the raw signature bytes from the COSE_Sign1 array.
+    fn extract_signature_bytes(&self) -> Result<Vec<u8>, Error> {
+        let raw = self.contents.get_raw(3);
+        let bytes: ByteBuf = serde_cbor::from_slice(raw)?;
+        Ok(bytes.into_vec())
+    }
+
+    /// Sign a payload with external_aad (domain separation).
+    pub fn new_with_aad<T>(
+        payload: &T,
+        unprotected: Option<COSEHeaderMap>,
+        sign_key: &dyn SigningPrivateKey,
+        external_aad: &[u8],
+    ) -> Result<Self, Error>
+    where
+        T: Serializable,
+    {
+        use crate::cose_aad::{serialize_protected_header, sig1_structure_bytes};
+        use aws_nitro_enclaves_cose::crypto::Hash;
+
+        let (sig_alg, digest) = sign_key.get_parameters()?;
+        let protected_bytes = serialize_protected_header(sig_alg as i8)?;
+        let payload_bytes = payload.serialize_data()?;
+
+        let sig_struct = sig1_structure_bytes(&protected_bytes, external_aad, &payload_bytes)?;
+        let struct_digest = Openssl::hash(digest, &sig_struct)?;
+        let signature = sign_key.sign(struct_digest.as_ref())?;
+
+        // Build COSE_Sign1_Tagged manually: #6.18([protected, unprotected, payload, signature])
+        let unprotected_map: aws_nitro_enclaves_cose::header_map::HeaderMap = match unprotected {
+            Some(v) => v.into(),
+            None => aws_nitro_enclaves_cose::header_map::HeaderMap::new(),
+        };
+        let cose_tuple = (
+            ByteBuf::from(protected_bytes),
+            &unprotected_map,
+            ByteBuf::from(payload_bytes),
+            ByteBuf::from(signature),
+        );
+        let tagged = serde_cbor::tags::Tagged::new(Some(COSESIGN_TAG), &cose_tuple);
+        let cose_bytes = serde_cbor::to_vec(&tagged)?;
+
+        // Parse back into COSESign (validates structure)
+        Self::deserialize_data(&cose_bytes)
+    }
+
+    /// Sign an EAT payload with external_aad.
+    pub fn from_eat_with_aad<ES>(
+        eat: EATokenPayload<ES>,
+        unprotected: Option<COSEHeaderMap>,
+        sign_key: &dyn SigningPrivateKey,
+        external_aad: &[u8],
+    ) -> Result<Self, Error>
+    where
+        ES: PayloadState,
+    {
+        let claims = eat.to_map();
+        Self::new_with_aad(&claims.0, unprotected, sign_key, external_aad)
+    }
+
+    /// Verify a COSE_Sign1 signature with external_aad.
+    pub fn verify_with_aad(
+        &self,
+        sign_key: &dyn SigningPublicKey,
+        external_aad: &[u8],
+    ) -> Result<(), Error> {
+        use crate::cose_aad::sig1_structure_bytes;
+        use aws_nitro_enclaves_cose::crypto::Hash;
+
+        let (sig_alg, digest) = sign_key.get_parameters()?;
+        let protected_bytes = self.extract_protected_bytes()?;
+        let payload_bytes = self.extract_payload_bytes()?;
+        let signature_bytes = self.extract_signature_bytes()?;
+
+        // Validate protected header algorithm
+        let protected: aws_nitro_enclaves_cose::header_map::HeaderMap =
+            serde_cbor::from_slice(&protected_bytes)?;
+        if let Some(serde_cbor::Value::Integer(alg)) =
+            protected.get(&serde_cbor::Value::Integer(1))
+        {
+            if *alg != (sig_alg as i8 as i128) {
+                return Err(Error::InconsistentValue(
+                    "Protected header algorithm mismatch",
+                ));
+            }
+        }
+
+        let sig_struct = sig1_structure_bytes(&protected_bytes, external_aad, &payload_bytes)?;
+        let struct_digest = Openssl::hash(digest, &sig_struct)?;
+
+        if sign_key.verify(struct_digest.as_ref(), &signature_bytes)? {
+            Ok(())
+        } else {
+            Err(Error::InconsistentValue("Signature verification failed"))
+        }
+    }
+
+    /// Verify and return the deserialized payload, using external_aad.
+    pub fn get_payload_with_aad<T>(
+        &self,
+        key: &dyn SigningPublicKey,
+        external_aad: &[u8],
+    ) -> Result<T, Error>
+    where
+        T: Serializable,
+    {
+        self.verify_with_aad(key, external_aad)?;
+        let payload_bytes = self.extract_payload_bytes()?;
+        T::deserialize_data(&payload_bytes)
+    }
 }
 
 #[derive(Debug)]
