@@ -1204,6 +1204,8 @@ impl Iterator for ServiceInfoIter<'_> {
     }
 }
 
+const MAX_MESSAGE_SIZE: u16 = (2 ^ 16) - 1;
+
 #[derive(Debug)]
 pub struct TO2ProveOVHdrPayload {
     contents: ParsedArray<crate::cborparser::ParsedArraySize8>,
@@ -1276,7 +1278,7 @@ impl TO2ProveOVHdrPayload {
         contents.set(4, &b_signature_info)?;
         contents.set(5, &a_key_exchange)?;
         contents.set(6, &hello_device_hash)?;
-        contents.set(7, &crate::messages::v11::to2::MAX_MESSAGE_SIZE)?;
+        contents.set(7, &MAX_MESSAGE_SIZE)?;
         let contents = contents.build();
 
         Ok(TO2ProveOVHdrPayload {
@@ -1289,7 +1291,7 @@ impl TO2ProveOVHdrPayload {
             cached_b_signature_info: b_signature_info,
             cached_a_key_exchange: a_key_exchange,
             cached_hello_device_hash: hello_device_hash,
-            cached_max_owner_message_size: crate::messages::v11::to2::MAX_MESSAGE_SIZE,
+            cached_max_owner_message_size: MAX_MESSAGE_SIZE,
         })
     }
 

@@ -48,26 +48,12 @@ pub trait Message: Send + Serializable + Sized {
             Err(e) => {
                 eprintln!("Error serializing response: {e:?}");
 
-                let errmsg = match Self::protocol_version() {
-                    ProtocolVersion::Version1_0 => v11::ErrorMessage::new(
-                        ErrorCode::InternalServerError,
-                        Self::message_type(),
-                        "Error serializing response".to_string(),
-                        0,
-                    ),
-                    ProtocolVersion::Version1_1 => v11::ErrorMessage::new(
-                        ErrorCode::InternalServerError,
-                        Self::message_type(),
-                        "Error serializing response".to_string(),
-                        0,
-                    ),
-                    ProtocolVersion::Version2_0 => v11::ErrorMessage::new(
-                        ErrorCode::InternalServerError,
-                        Self::message_type(),
-                        "Error serializing response".to_string(),
-                        0,
-                    ),
-                };
+                let errmsg = v11::ErrorMessage::new(
+                    ErrorCode::InternalServerError,
+                    Self::message_type(),
+                    "Error serializing response".to_string(),
+                    0,
+                );
                 serde_cbor::to_vec(&errmsg).expect("Error serializing error message")
             }
         }

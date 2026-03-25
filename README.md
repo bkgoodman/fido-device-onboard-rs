@@ -147,6 +147,22 @@ This design means a firmware or installer team can take this codebase, leave
 the FDO protocol stack untouched, and only implement the BMO callback layer
 for their specific hardware.
 
+### Binary sizes
+
+Stripped release builds (x86_64 Linux):
+
+| Binary | Size | What it does |
+| ------ | ---: | ------------ |
+| `fdo-client-linuxapp` | 6.9 MB | TO1 + TO2 onboarding with BMO + delegate support |
+| `fdo-manufacturing-client` | 6.8 MB | Device initialization (DI) |
+
+The biggest contributors are CBOR serialization (~569 KB), the async HTTP
+stack (~694 KB for tokio/hyper/h2), and regex pulled in transitively (~638 KB).
+Our actual FDO protocol code is ~600 KB total. OpenSSL and TPM libraries are
+dynamically linked and not included in the binary size. See
+`FDO_2.0_MIGRATION_PLAN.md` for the full dependency breakdown and size
+reduction roadmap.
+
 ---
 
 *The original upstream README follows below for reference.*
