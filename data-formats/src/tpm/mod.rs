@@ -3,9 +3,8 @@
 
 //! TPM spec-compliant credential storage for FDO.
 //!
-//! Implements "Securing FDO Credentials in the TPM v1.0" using NV indices
-//! for credential storage, persistent handles for keys, and Endorsement
-//! hierarchy for key derivation with unique strings.
+//! Implements "Securing FDO Credentials in the TPM" using a single NV index
+//! (DCTPM) for all FDO device credentials, and persistent handles for keys.
 //!
 //! This module is only compiled when the `tpm_support` feature is enabled.
 
@@ -22,43 +21,50 @@ use tss_esapi::Context;
 use crate::errors::Error;
 
 // ============================================================
-// NV Index Handles (per spec section 4.2)
+// NV Index Handle
 // ============================================================
 
-/// DCActive flag: 1 byte, 0x00 = not initialized, 0x01 = initialized.
-pub const DC_ACTIVE_INDEX: u32 = 0x01D1_0000;
-/// DCTPM: GUID (16 bytes) + DeviceInfo string.
+/// DCTPM: Single mandatory NV index for all FDO credentials (CBOR-encoded).
+/// Contains: Magic, Active, Version, DeviceInfo, GUID, RvInfo, PubKeyHash,
+/// DeviceKeyType, DeviceKeyHandle, HMACKeyHandle.
 pub const DCTPM_INDEX: u32 = 0x01D1_0001;
-/// DCOV: CBOR-encoded credential metadata (version, RvInfo, PubKeyHash, KeyType).
-pub const DCOV_INDEX: u32 = 0x01D1_0002;
+
+/// Magic value identifying valid FDO DCTPM data. ASCII "FDO1" = 0x46444F31.
+/// Readers MUST verify this before interpreting the CBOR structure.
+pub const DCTPM_MAGIC: u32 = 0x4644_4F31;
+
+// Optional provisioning-entity NV indices (not required for client interop).
+
 /// HMAC Unique String: 32 bytes random seed for HMAC key derivation.
+/// Only needed if using Primary keys with policy-based auth.
 pub const HMAC_US_INDEX: u32 = 0x01D1_0003;
 /// Device Key Unique String: 64 bytes (P-256) or 96 bytes (P-384) for key derivation.
+/// Only needed if using Primary keys with policy-based auth.
 pub const DEVICE_KEY_US_INDEX: u32 = 0x01D1_0004;
-/// FDO Certificate (optional, not used in production).
-pub const FDO_CERT_INDEX: u32 = 0x01D1_0005;
 
 // ============================================================
-// Persistent Object Handles
+// Persistent Object Handles (example values for testing)
 // ============================================================
 
-/// Device Attestation Key (ECC signing key).
+/// Device Attestation Key (ECC signing key) — default persistent handle.
+/// Implementations MAY use any valid persistent handle; the chosen handle
+/// is recorded in DCTPM.DeviceKeyHandle.
 pub const DAK_HANDLE: u32 = 0x8102_0002;
-/// HMAC key.
+/// HMAC key — default persistent handle.
+/// Implementations MAY use any valid persistent handle; the chosen handle
+/// is recorded in DCTPM.HMACKeyHandle.
 pub const HMAC_KEY_HANDLE: u32 = 0x8102_0003;
 
 // ============================================================
-// NV Attribute Profiles (per spec Table 9)
+// NV Attribute Profiles
 // ============================================================
 
 /// NV index attribute profile, determining access controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvProfile {
-    /// Profile A (DCActive): Owner+Auth R/W, NoDA, PlatformCreate.
-    A,
-    /// Profile B (DCTPM, Unique Strings): Auth-only R/W, NoDA, PlatformCreate.
+    /// Profile B (Unique Strings): Auth-only R/W, NoDA, PlatformCreate.
     B,
-    /// Profile C (DCOV, FDO_Cert): Owner+Auth R/W, NoDA, no PlatformCreate.
+    /// Profile C (DCTPM): Owner+Auth R/W, NoDA, no PlatformCreate.
     C,
 }
 

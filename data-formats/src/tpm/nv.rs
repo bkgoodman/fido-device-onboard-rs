@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! NV index operations for FDO credential storage.
+//!
+//! Consolidated single-NV-index model: all FDO credentials are stored in
+//! a single DCTPM NV index as a CBOR structure with a magic header.
 
 use std::convert::TryFrom;
 
@@ -19,23 +22,22 @@ use tss_esapi::{
 use crate::errors::Error;
 
 use super::{
-    NvProfile, DAK_HANDLE, DCOV_INDEX, DCTPM_INDEX, DC_ACTIVE_INDEX, DEVICE_KEY_US_INDEX,
-    FDO_CERT_INDEX, HMAC_KEY_HANDLE, HMAC_US_INDEX,
+    NvProfile, DAK_HANDLE, DCTPM_INDEX, DEVICE_KEY_US_INDEX, HMAC_KEY_HANDLE, HMAC_US_INDEX,
 };
 
-/// Information read from TPM NV credential indices.
+/// Information read from TPM NV credential index.
 #[derive(Debug)]
 pub struct NvCredentialInfo {
-    /// DCActive flag (true = device initialized).
-    pub active: bool,
-    /// Device GUID (16 bytes) from DCTPM.
-    pub guid: [u8; 16],
-    /// Device info string from DCTPM.
-    pub device_info: String,
-    /// True if DCOV NV index exists.
-    pub has_dcov: bool,
-    /// Raw DCOV content (CBOR-encoded).
-    pub dcov_data: Vec<u8>,
+    /// True if DCTPM NV index exists and contains data.
+    pub has_dctpm: bool,
+    /// Raw DCTPM CBOR content.
+    pub raw_dctpm: Vec<u8>,
+    /// DCTPM NV index size.
+    pub dctpm_size: u16,
+    /// HMAC Unique String NV index size (0 = not defined).
+    pub hmac_us_size: u16,
+    /// Device Key Unique String NV index size (0 = not defined).
+    pub device_key_us_size: u16,
     /// True if persistent DAK handle exists.
     pub has_dak: bool,
     /// True if persistent HMAC key handle exists.
@@ -44,7 +46,7 @@ pub struct NvCredentialInfo {
 
 /// Build NV index attributes for a given profile.
 ///
-/// If `use_platform` is false, Profile A/B indices use Owner hierarchy
+/// If `use_platform` is false, Profile B indices use Owner hierarchy
 /// instead of Platform (for Linux userspace where Platform is locked).
 fn build_nv_attrs(
     profile: NvProfile,
@@ -53,17 +55,6 @@ fn build_nv_attrs(
     let mut builder = NvIndexAttributesBuilder::new();
 
     match profile {
-        NvProfile::A => {
-            builder = builder
-                .with_owner_write(true)
-                .with_auth_write(true)
-                .with_owner_read(true)
-                .with_auth_read(true)
-                .with_no_da(true);
-            if use_platform {
-                builder = builder.with_platform_create(true);
-            }
-        }
         NvProfile::B => {
             builder = builder
                 .with_auth_write(true)
@@ -90,7 +81,7 @@ fn build_nv_attrs(
 /// Auth handle for NV define operations.
 fn define_auth(profile: NvProfile, use_platform: bool) -> Provision {
     match profile {
-        NvProfile::A | NvProfile::B => {
+        NvProfile::B => {
             if use_platform {
                 Provision::Platform
             } else {
@@ -104,7 +95,7 @@ fn define_auth(profile: NvProfile, use_platform: bool) -> Provision {
 /// Auth handle for NV read/write operations.
 fn rw_auth(profile: NvProfile, nv_handle: NvIndexHandle) -> NvAuth {
     match profile {
-        NvProfile::A | NvProfile::C => NvAuth::Owner,
+        NvProfile::C => NvAuth::Owner,
         NvProfile::B => NvAuth::NvIndex(nv_handle),
     }
 }
@@ -194,14 +185,7 @@ pub fn undefine_nv_space(ctx: &mut Context, index: u32, use_platform: bool) {
 
 /// Remove all FDO NV indices and persistent handles.
 pub fn cleanup_fdo_state(ctx: &mut Context, use_platform: bool) {
-    for index in &[
-        DC_ACTIVE_INDEX,
-        DCTPM_INDEX,
-        DCOV_INDEX,
-        HMAC_US_INDEX,
-        DEVICE_KEY_US_INDEX,
-        FDO_CERT_INDEX,
-    ] {
+    for index in &[DCTPM_INDEX, HMAC_US_INDEX, DEVICE_KEY_US_INDEX] {
         undefine_nv_space(ctx, *index, use_platform);
     }
     for handle in &[DAK_HANDLE, HMAC_KEY_HANDLE] {
@@ -209,44 +193,36 @@ pub fn cleanup_fdo_state(ctx: &mut Context, use_platform: bool) {
     }
 }
 
-/// Read all FDO credential data from TPM NV indices.
+/// Read FDO credential data from the TPM DCTPM NV index.
 pub fn read_nv_credentials(ctx: &mut Context) -> Result<NvCredentialInfo, Error> {
     let mut info = NvCredentialInfo {
-        active: false,
-        guid: [0u8; 16],
-        device_info: String::new(),
-        has_dcov: false,
-        dcov_data: Vec::new(),
+        has_dctpm: false,
+        raw_dctpm: Vec::new(),
+        dctpm_size: 0,
+        hmac_us_size: 0,
+        device_key_us_size: 0,
         has_dak: false,
         has_hmac_key: false,
     };
 
-    // DCActive (Profile A: OwnerRead)
-    if let Ok((nv_public, _, nv_handle)) = read_nv_public(ctx, DC_ACTIVE_INDEX) {
-        let size = nv_public.data_size() as u16;
-        if let Ok(data) = read_nv(ctx, nv_handle, size, NvProfile::A) {
-            info.active = !data.is_empty() && data[0] == 0x01;
-        }
-    }
-
-    // DCTPM (Profile B: AuthRead)
+    // DCTPM — single consolidated NV index (OwnerRead)
     if let Ok((nv_public, _, nv_handle)) = read_nv_public(ctx, DCTPM_INDEX) {
         let size = nv_public.data_size() as u16;
-        if let Ok(data) = read_nv(ctx, nv_handle, size, NvProfile::B) {
-            if data.len() >= 16 {
-                info.guid.copy_from_slice(&data[..16]);
-                info.device_info = String::from_utf8_lossy(&data[16..]).to_string();
-            }
+        info.dctpm_size = size;
+        info.has_dctpm = true;
+        if let Ok(data) = read_nv(ctx, nv_handle, size, NvProfile::C) {
+            info.raw_dctpm = data;
         }
     }
 
-    // DCOV (Profile C: OwnerRead)
-    if let Ok((nv_public, _, nv_handle)) = read_nv_public(ctx, DCOV_INDEX) {
-        let size = nv_public.data_size() as u16;
-        info.has_dcov = true;
-        if let Ok(data) = read_nv(ctx, nv_handle, size, NvProfile::C) {
-            info.dcov_data = data;
-        }
+    // HMAC_US (optional, provisioning-entity artifact)
+    if let Ok((nv_public, _, _)) = read_nv_public(ctx, HMAC_US_INDEX) {
+        info.hmac_us_size = nv_public.data_size() as u16;
+    }
+
+    // DeviceKey_US (optional, provisioning-entity artifact)
+    if let Ok((nv_public, _, _)) = read_nv_public(ctx, DEVICE_KEY_US_INDEX) {
+        info.device_key_us_size = nv_public.data_size() as u16;
     }
 
     // Check persistent key handles

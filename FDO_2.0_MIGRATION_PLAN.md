@@ -323,7 +323,7 @@ boundary. The TPM-specific part is below that.
 
 ### 8c: New TPM spec alignment
 
-**Completed: NV-based credential storage (DI side)**
+**Completed: NV-based credential storage (DI side) — OLD MULTI-NV MODEL**
 - [x] New `data-formats/src/tpm/` module: `mod.rs` (constants, profiles, context), `nv.rs` (NV operations), `key.rs` (key management)
 - [x] NV index constants matching Go: `0x01D10000`-`0x01D10005` (DCActive, DCTPM, DCOV, US indices)
 - [x] Persistent handle constants: `0x81020002` (DAK), `0x81020003` (HMAC key)
@@ -334,6 +334,29 @@ boundary. The TPM-specific part is below that.
 - [x] `KeyReference::SpecTpm` variant in manufacturing-client with full NV provisioning flow
 - [x] DI stores credentials in NV indices (DCTPM: GUID+DeviceInfo, DCOV: CBOR metadata, DCActive: flag) -- no file written
 - [x] Integration test: DI with NV-backed keys against Go server (verified with `tpm2_nvreadpublic`)
+
+**⚠️ BREAKING: Go library migrated to consolidated single-NV model (2026-03-28)**
+
+The Go library (`go-fdo`) has been updated to store ALL FDO credentials in a
+single DCTPM NV index as a CBOR structure with a magic header ("FDO1" = 0x46444F31).
+The old multi-NV model (DCActive + DCTPM + DCOV as separate indices) is obsolete.
+The Rust code still uses the old model and needs to be updated.
+
+See `TPM_NV_CONSOLIDATION_TODO.md` for the full migration guide.
+
+Key changes:
+- Single NV index (0x01D10001) replaces 3 separate indices
+- CBOR structure includes Magic, Active, GUID, DeviceInfo, RvInfo, key handles
+- DCActive is now a field inside the CBOR, not a separate NV index
+- Key persistence is mandatory (both DAK and HMAC)
+- Keys may be Primary OR ordinary (provisioning entity's choice)
+- Key handles recorded in DCTPM, not assumed to be at well-known handles
+
+**Remaining: Consolidation migration**
+- [ ] Update Rust constants/structs to match new single-NV model (see TPM_NV_CONSOLIDATION_TODO.md)
+- [ ] Update DI write path for consolidated CBOR format with magic
+- [ ] Update credential load path to read consolidated format
+- [ ] Update TO2 credential update to write consolidated format
 
 **Remaining: TO2 side (load from NV)**
 - [ ] Update `client-linuxapp` to discover and load credentials from TPM NV indices
