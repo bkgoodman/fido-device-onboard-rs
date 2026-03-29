@@ -815,10 +815,18 @@ enum KeyReference {
     #[cfg(feature = "tpm_support")]
     SpecTpm {
         tss_context: Box<tss_esapi::Context>,
+        /// Persistent DAK handle for signing.
+        dak_handle: tss_esapi::handles::KeyHandle,
+        /// Persistent HMAC key handle.
+        hmac_handle: tss_esapi::handles::KeyHandle,
         /// Marshalled public key bytes.
         public_bytes: Vec<u8>,
         /// Whether to use Platform hierarchy for NV (vs Owner).
         use_platform: bool,
+        /// DeviceKey Unique String NV handle (for policy session auth).
+        dk_us_nv_handle: tss_esapi::handles::NvIndexHandle,
+        /// HMAC Unique String NV handle (for policy session auth).
+        hmac_us_nv_handle: tss_esapi::handles::NvIndexHandle,
     },
 }
 
@@ -1090,14 +1098,33 @@ impl KeyReference {
             tpm::HMAC_KEY_HANDLE
         );
 
-        // Step 8: Load persistent DAK handle to verify it exists
-        let _dak_handle = key::load_persistent_signing_key(&mut ctx, tpm::DAK_HANDLE)
+        // Step 8: Define DCActive NV (Profile A), write 0x00 (DI in progress)
+        let dc_active_handle = nv::define_nv_space(
+            &mut ctx,
+            tpm::DC_ACTIVE_INDEX,
+            1,
+            tpm::NvProfile::A,
+            use_platform,
+        )
+        .context("Error defining DCActive NV")?;
+        nv::write_nv(&mut ctx, dc_active_handle, &[0x00], tpm::NvProfile::A)
+            .context("Error writing DCActive NV")?;
+        log::debug!("DCActive set to 0x00 (DI in progress)");
+
+        // Step 9: Load persistent handles for use during DI protocol
+        let dak_handle = key::load_persistent_signing_key(&mut ctx, tpm::DAK_HANDLE)
             .context("Error loading persistent DAK")?;
+        let hmac_handle = key::load_persistent_signing_key(&mut ctx, tpm::HMAC_KEY_HANDLE)
+            .context("Error loading persistent HMAC key")?;
 
         Ok(KeyReference::SpecTpm {
             tss_context: Box::new(ctx),
+            dak_handle,
+            hmac_handle,
             public_bytes,
             use_platform,
+            dk_us_nv_handle: dk_us_handle,
+            hmac_us_nv_handle: hmac_us_handle,
         })
     }
 
@@ -1543,7 +1570,10 @@ impl KeyReference {
             }
             #[cfg(feature = "tpm_support")]
             KeyReference::SpecTpm {
+                ref mut tss_context,
+                dak_handle,
                 public_bytes,
+                dk_us_nv_handle,
                 ..
             } => {
                 let signing_pub = tss_esapi::structures::Public::unmarshall(public_bytes)
@@ -1692,17 +1722,68 @@ impl KeyReference {
                 ..
             } => {
                 use fdo_data_formats::tpm::{self, nv};
-                use std::collections::BTreeMap;
 
-                // Derive key type from public bytes
+                // Write DCTPM NV: GUID (16 bytes) + DeviceInfo string
+                // Guid serialization: extract raw bytes via CBOR roundtrip
+                let guid_bytes = guid.serialize_data().context("Error serializing GUID")?;
+                // The CBOR-encoded GUID is a bstr; for NV we need raw 16 bytes.
+                // Use the serialized form directly (Go uses raw GUID bytes).
+                // Actually the Guid inner data is a Vec<u8> of 16 bytes.
+                // We can serialize to CBOR and extract, or just use the serialized GUID.
+                // For interop with Go: DCTPM = raw GUID (16 bytes) + DeviceInfo string.
+                // Let's extract the inner bytes by serializing to CBOR bstr and unwrapping.
+                let guid_raw: Vec<u8> = {
+                    let mut buf = Vec::new();
+                    ciborium::ser::into_writer(&guid, &mut buf)
+                        .context("Error CBOR-encoding GUID")?;
+                    // CBOR bstr: major type 2 + 16 bytes = [0x50, ...16 bytes...]
+                    if buf.len() >= 17 && buf[0] == 0x50 {
+                        buf[1..17].to_vec()
+                    } else {
+                        // Fallback: use the serialized data directly
+                        guid_bytes
+                    }
+                };
+                let mut dctpm_data = Vec::with_capacity(16 + device_info.len());
+                dctpm_data.extend_from_slice(&guid_raw[..std::cmp::min(guid_raw.len(), 16)]);
+                // Pad to 16 if shorter
+                while dctpm_data.len() < 16 {
+                    dctpm_data.push(0);
+                }
+                dctpm_data.extend_from_slice(device_info.as_bytes());
+
+                let dctpm_handle = nv::define_nv_space(
+                    &mut tss_context,
+                    tpm::DCTPM_INDEX,
+                    dctpm_data.len(),
+                    tpm::NvProfile::B,
+                    use_platform,
+                )
+                .context("Error defining DCTPM NV")?;
+                nv::write_nv(
+                    &mut tss_context,
+                    dctpm_handle,
+                    &dctpm_data,
+                    tpm::NvProfile::B,
+                )
+                .context("Error writing DCTPM NV")?;
+                log::info!(
+                    "Wrote DCTPM NV ({} bytes): GUID + DeviceInfo",
+                    dctpm_data.len()
+                );
+
+                // Write DCOV NV: CBOR array matching Go's dcovNVData encoding.
+                // Go encodes dcovNVData as CBOR array (not map): [version, rvinfo, pubkeyhash, keytype]
+                // Each element uses the FDO protocol's native CBOR encoding.
                 let key_type_value: u8 = {
+                    // Derive key type from public bytes
                     let pub_struct = tss_esapi::structures::Public::unmarshall(&public_bytes)
                         .context("Error unmarshalling public for key type")?;
                     match pub_struct {
                         tss_esapi::structures::Public::Ecc { parameters, .. } => {
                             match parameters.ecc_curve() {
-                                tss_esapi::interface_types::ecc::EccCurve::NistP256 => 10,
-                                tss_esapi::interface_types::ecc::EccCurve::NistP384 => 11,
+                                tss_esapi::interface_types::ecc::EccCurve::NistP256 => 10, // SECP256R1
+                                tss_esapi::interface_types::ecc::EccCurve::NistP384 => 11, // SECP384R1
                                 _ => 0,
                             }
                         }
@@ -1710,88 +1791,63 @@ impl KeyReference {
                     }
                 };
 
-                // Extract raw GUID bytes (16 bytes)
-                let guid_raw: Vec<u8> = {
-                    let mut buf = Vec::new();
-                    ciborium::ser::into_writer(&guid, &mut buf)
-                        .context("Error CBOR-encoding GUID")?;
-                    if buf.len() >= 17 && buf[0] == 0x50 {
-                        buf[1..17].to_vec()
-                    } else {
-                        guid.serialize_data().context("Error serializing GUID")?
-                    }
+                // Serialize DCOV as CBOR array matching Go's dcovNVData encoding:
+                // [version, rvinfo, pubkeyhash, keytype, hmac_handle]
+                // Go's custom CBOR library encodes structs as arrays (not maps),
+                // with field ordering determined by `keyasint` struct tags.
+                let dcov_payload = {
+                    let version_val = serde_cbor::Value::Integer(protocol_version as i128);
+                    let rvinfo_val = serde_cbor::value::to_value(&rvinfo)
+                        .unwrap_or(serde_cbor::Value::Array(vec![]));
+                    let hash_val =
+                        serde_cbor::value::to_value(&manufacturer_public_key_hash)
+                            .unwrap_or(serde_cbor::Value::Null);
+                    let keytype_val = serde_cbor::Value::Integer(key_type_value as i128);
+                    let hmac_handle_val =
+                        serde_cbor::Value::Integer(tpm::HMAC_KEY_HANDLE as i128);
+
+                    let dcov_array = serde_cbor::Value::Array(vec![
+                        version_val,
+                        rvinfo_val,
+                        hash_val,
+                        keytype_val,
+                        hmac_handle_val,
+                    ]);
+                    serde_cbor::to_vec(&dcov_array)
+                        .context("Error encoding DCOV CBOR array")?
                 };
 
-                // Build consolidated DCTPM CBOR map with integer keys:
-                // 0=Magic, 1=Active, 2=Version, 3=DeviceInfo, 4=GUID,
-                // 5=RvInfo, 6=PubKeyHash, 7=KeyType, 8=DAKHandle, 9=HMACHandle
-                let mut map = BTreeMap::new();
-                map.insert(
-                    serde_cbor::Value::Integer(0),
-                    serde_cbor::Value::Integer(tpm::DCTPM_MAGIC as i128),
-                );
-                map.insert(
-                    serde_cbor::Value::Integer(1),
-                    serde_cbor::Value::Bool(true),
-                );
-                map.insert(
-                    serde_cbor::Value::Integer(2),
-                    serde_cbor::Value::Integer(protocol_version as i128),
-                );
-                map.insert(
-                    serde_cbor::Value::Integer(3),
-                    serde_cbor::Value::Text(device_info),
-                );
-                map.insert(
-                    serde_cbor::Value::Integer(4),
-                    serde_cbor::Value::Bytes(guid_raw),
-                );
-                let rvinfo_val = serde_cbor::value::to_value(&rvinfo)
-                    .unwrap_or(serde_cbor::Value::Array(vec![]));
-                map.insert(serde_cbor::Value::Integer(5), rvinfo_val);
-                let hash_val = serde_cbor::value::to_value(&manufacturer_public_key_hash)
-                    .unwrap_or(serde_cbor::Value::Null);
-                map.insert(serde_cbor::Value::Integer(6), hash_val);
-                map.insert(
-                    serde_cbor::Value::Integer(7),
-                    serde_cbor::Value::Integer(key_type_value as i128),
-                );
-                map.insert(
-                    serde_cbor::Value::Integer(8),
-                    serde_cbor::Value::Integer(tpm::DAK_HANDLE as i128),
-                );
-                map.insert(
-                    serde_cbor::Value::Integer(9),
-                    serde_cbor::Value::Integer(tpm::HMAC_KEY_HANDLE as i128),
-                );
-
-                let dctpm_cbor = serde_cbor::to_vec(&serde_cbor::Value::Map(
-                    map.into_iter().collect(),
-                ))
-                .context("Error encoding consolidated DCTPM CBOR")?;
-
-                // Write single DCTPM NV index (Profile C: Owner+Auth R/W)
-                let dctpm_handle = nv::define_nv_space(
+                let dcov_handle = nv::define_nv_space(
                     &mut tss_context,
-                    tpm::DCTPM_INDEX,
-                    dctpm_cbor.len(),
+                    tpm::DCOV_INDEX,
+                    dcov_payload.len(),
                     tpm::NvProfile::C,
                     use_platform,
                 )
-                .context("Error defining DCTPM NV")?;
+                .context("Error defining DCOV NV")?;
                 nv::write_nv(
                     &mut tss_context,
-                    dctpm_handle,
-                    &dctpm_cbor,
+                    dcov_handle,
+                    &dcov_payload,
                     tpm::NvProfile::C,
                 )
-                .context("Error writing DCTPM NV")?;
-                log::info!(
-                    "Wrote consolidated DCTPM NV ({} bytes, magic=0x{:08X})",
-                    dctpm_cbor.len(),
-                    tpm::DCTPM_MAGIC
-                );
-                log::info!("Credentials stored in single TPM NV index (no file written)");
+                .context("Error writing DCOV NV")?;
+                log::info!("Wrote DCOV NV ({} bytes)", dcov_payload.len());
+
+                // Update DCActive to 0x01 (device initialized)
+                if let Ok((_, _, dc_active_handle)) =
+                    nv::read_nv_public(&mut tss_context, tpm::DC_ACTIVE_INDEX)
+                {
+                    nv::write_nv(
+                        &mut tss_context,
+                        dc_active_handle,
+                        &[0x01],
+                        tpm::NvProfile::A,
+                    )
+                    .context("Error updating DCActive to 0x01")?;
+                }
+                log::info!("DCActive set to 0x01 (device initialized)");
+                log::info!("Credentials stored in TPM NV indices (no file written)");
 
                 Ok(())
             }

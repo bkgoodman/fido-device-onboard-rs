@@ -26,4 +26,3 @@ fido-device-onboard-rs-*-vendor-patched.tar.xz
 ephemeral-test-files/
 .gitignore
 .vscode/
-securing-fdo-in-tpm.bs
