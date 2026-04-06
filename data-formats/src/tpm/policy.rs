@@ -1,10 +1,21 @@
 // Copyright (c) 2026, Dell Technologies, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! TPM policy session operations for FDO spec-compliant key authorization.
+//! LEGACY: TPM policy session operations for FDO key authorization.
 //!
-//! Implements the compound policy per FDO TPM spec Table 12:
+//! This module implements the PolicyNV+PolicySecret compound policy that was
+//! required by earlier versions of the FDO TPM spec when keys had
+//! `userWithAuth=0`. The current spec (Table 11) uses `userWithAuth=1` with
+//! empty authValue, making policy sessions unnecessary for key usage.
+//!
+//! This module is retained for reference and backward compatibility with
+//! devices provisioned under the old authorization model.
+//!
+//! # Old Model (userWithAuth=0, authPolicy required):
 //!   PolicyNV(US_NV, offset=0, operand=0x00, UnsignedGE) + PolicySecret(US_NV)
+//!
+//! # Current Model (userWithAuth=1, no authPolicy):
+//!   Empty password auth (null auth) via TPM2_Sign / TPM2_HMAC
 //!
 //! # Known Limitation: tss-esapi 7.6 Missing PolicyNV
 //!

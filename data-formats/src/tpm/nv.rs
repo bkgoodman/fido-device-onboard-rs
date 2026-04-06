@@ -19,23 +19,21 @@ use tss_esapi::{
 use crate::errors::Error;
 
 use super::{
-    NvProfile, DAK_HANDLE, DCOV_INDEX, DCTPM_INDEX, DC_ACTIVE_INDEX, DEVICE_KEY_US_INDEX,
-    FDO_CERT_INDEX, HMAC_KEY_HANDLE, HMAC_US_INDEX,
+    NvProfile, DAK_HANDLE, DCOV_INDEX, DCTPM_INDEX, DC_ACTIVE_INDEX,
+    FDO_CERT_INDEX, HMAC_KEY_HANDLE,
 };
 
 /// Information read from TPM NV credential indices.
 #[derive(Debug)]
 pub struct NvCredentialInfo {
-    /// DCActive flag (true = device initialized).
+    /// True if consolidated DCTPM was found and decoded.
+    pub has_dctpm: bool,
+    /// Raw DCTPM CBOR bytes (consolidated array).
+    pub raw_dctpm: Vec<u8>,
+    /// DCTPM Magic value (should be 0x46444F31 = "FDO1").
+    pub magic: u32,
+    /// DCActive flag (true = device initialized). From consolidated DCTPM[1].
     pub active: bool,
-    /// Device GUID (16 bytes) from DCTPM.
-    pub guid: [u8; 16],
-    /// Device info string from DCTPM.
-    pub device_info: String,
-    /// True if DCOV NV index exists.
-    pub has_dcov: bool,
-    /// Raw DCOV content (CBOR-encoded).
-    pub dcov_data: Vec<u8>,
     /// True if persistent DAK handle exists.
     pub has_dak: bool,
     /// True if persistent HMAC key handle exists.
@@ -65,8 +63,11 @@ fn build_nv_attrs(
             }
         }
         NvProfile::B => {
+            // Profile B (Unique Strings): per Go NVProfileB
             builder = builder
+                .with_owner_write(true)
                 .with_auth_write(true)
+                .with_owner_read(true)
                 .with_auth_read(true)
                 .with_no_da(true);
             if use_platform {
@@ -74,13 +75,17 @@ fn build_nv_attrs(
             }
         }
         NvProfile::C => {
+            // Profile C (DCTPM, DCOV): per Go NVProfileDCTPM
             builder = builder
                 .with_owner_write(true)
                 .with_auth_write(true)
                 .with_owner_read(true)
                 .with_auth_read(true)
                 .with_no_da(true);
-            // Profile C: no PlatformCreate
+            // Profile C: no PlatformCreate (survives TPM2_Clear only if Platform)
+            if use_platform {
+                builder = builder.with_platform_create(true);
+            }
         }
     }
 
@@ -102,10 +107,10 @@ fn define_auth(profile: NvProfile, use_platform: bool) -> Provision {
 }
 
 /// Auth handle for NV read/write operations.
-fn rw_auth(profile: NvProfile, nv_handle: NvIndexHandle) -> NvAuth {
+fn rw_auth(profile: NvProfile, _nv_handle: NvIndexHandle) -> NvAuth {
+    // All profiles use Owner auth for read/write (matching Go implementation)
     match profile {
-        NvProfile::A | NvProfile::C => NvAuth::Owner,
-        NvProfile::B => NvAuth::NvIndex(nv_handle),
+        NvProfile::A | NvProfile::B | NvProfile::C => NvAuth::Owner,
     }
 }
 
@@ -194,13 +199,14 @@ pub fn undefine_nv_space(ctx: &mut Context, index: u32, use_platform: bool) {
 
 /// Remove all FDO NV indices and persistent handles.
 pub fn cleanup_fdo_state(ctx: &mut Context, use_platform: bool) {
+    // Clean up current and legacy NV indices
     for index in &[
         DC_ACTIVE_INDEX,
         DCTPM_INDEX,
         DCOV_INDEX,
-        HMAC_US_INDEX,
-        DEVICE_KEY_US_INDEX,
         FDO_CERT_INDEX,
+        0x01D1_0003, // legacy HMAC_US (no longer used)
+        0x01D1_0004, // legacy DeviceKey_US (no longer used)
     ] {
         undefine_nv_space(ctx, *index, use_platform);
     }
@@ -210,42 +216,54 @@ pub fn cleanup_fdo_state(ctx: &mut Context, use_platform: bool) {
 }
 
 /// Read all FDO credential data from TPM NV indices.
+///
+/// Reads the consolidated DCTPM NV index (0x01D10001) which contains a CBOR
+/// array: [Magic, Active, Version, DeviceInfo, GUID, RvInfo, PubKeyHash,
+/// KeyType, DeviceKeyHandle, HMACKeyHandle].
+///
+/// Falls back to legacy DCActive (0x01D10000) if consolidated DCTPM is absent.
 pub fn read_nv_credentials(ctx: &mut Context) -> Result<NvCredentialInfo, Error> {
     let mut info = NvCredentialInfo {
+        has_dctpm: false,
+        raw_dctpm: Vec::new(),
+        magic: 0,
         active: false,
-        guid: [0u8; 16],
-        device_info: String::new(),
-        has_dcov: false,
-        dcov_data: Vec::new(),
         has_dak: false,
         has_hmac_key: false,
     };
 
-    // DCActive (Profile A: OwnerRead)
-    if let Ok((nv_public, _, nv_handle)) = read_nv_public(ctx, DC_ACTIVE_INDEX) {
-        let size = nv_public.data_size() as u16;
-        if let Ok(data) = read_nv(ctx, nv_handle, size, NvProfile::A) {
-            info.active = !data.is_empty() && data[0] == 0x01;
-        }
-    }
-
-    // DCTPM (Profile B: AuthRead)
+    // Try consolidated DCTPM (Profile C: OwnerRead)
     if let Ok((nv_public, _, nv_handle)) = read_nv_public(ctx, DCTPM_INDEX) {
         let size = nv_public.data_size() as u16;
-        if let Ok(data) = read_nv(ctx, nv_handle, size, NvProfile::B) {
-            if data.len() >= 16 {
-                info.guid.copy_from_slice(&data[..16]);
-                info.device_info = String::from_utf8_lossy(&data[16..]).to_string();
+        if let Ok(data) = read_nv(ctx, nv_handle, size, NvProfile::C) {
+            if !data.is_empty() {
+                info.raw_dctpm = data;
+                info.has_dctpm = true;
+
+                // Extract Magic [0] and Active [1] from consolidated DCTPM array
+                if let Ok(cbor) = serde_cbor::from_slice::<serde_cbor::Value>(&info.raw_dctpm) {
+                    if let serde_cbor::Value::Array(ref arr) = cbor {
+                        if arr.len() >= 2 {
+                            if let serde_cbor::Value::Integer(m) = &arr[0] {
+                                info.magic = *m as u32;
+                            }
+                            if let serde_cbor::Value::Bool(active) = &arr[1] {
+                                info.active = *active;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
-    // DCOV (Profile C: OwnerRead)
-    if let Ok((nv_public, _, nv_handle)) = read_nv_public(ctx, DCOV_INDEX) {
-        let size = nv_public.data_size() as u16;
-        info.has_dcov = true;
-        if let Ok(data) = read_nv(ctx, nv_handle, size, NvProfile::C) {
-            info.dcov_data = data;
+    // Fallback: check legacy DCActive (0x01D10000) if DCTPM not found or not active
+    if !info.has_dctpm {
+        if let Ok((nv_public, _, nv_handle)) = read_nv_public(ctx, DC_ACTIVE_INDEX) {
+            let size = nv_public.data_size() as u16;
+            if let Ok(data) = read_nv(ctx, nv_handle, size, NvProfile::A) {
+                info.active = !data.is_empty() && data[0] == 0x01;
+            }
         }
     }
 

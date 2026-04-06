@@ -8,8 +8,14 @@
 # Interactive demonstration of Rust <-> Go FDO 2.0 interoperability
 # with TPM-backed credential storage.
 #
-# Scenario A:  Rust DI  ->  Go Onboard   (Rust provisions, Go consumes)
-# Scenario B:  Go DI    ->  Rust Onboard (Go provisions, Rust consumes)
+# Scenarios (4 total — 2 directions × 2 key creation methods):
+#   A (child):   Rust DI (child-of-SRK)       → Go Onboard
+#   A (primary): Rust DI (primary+unique str)  → Go Onboard
+#   B (child):   Go DI (child-of-SRK)         → Rust Onboard
+#   B (primary): Go DI (primary+unique str)    → Rust Onboard
+#
+# Both creation methods produce identical persistent keys at the same
+# handles with the same attributes — usage (signing, HMAC) is identical.
 #
 # Requirements:
 #   - /dev/tpmrm0  (hardware TPM with resource manager)
@@ -18,9 +24,13 @@
 #   - Rust toolchain with cargo
 #
 # Usage:
-#   ./tpm_cross_walkthrough.sh            # Run both scenarios
-#   ./tpm_cross_walkthrough.sh a          # Scenario A only
-#   ./tpm_cross_walkthrough.sh b          # Scenario B only
+#   ./tpm_cross_walkthrough.sh            # Run all 4 scenarios
+#   ./tpm_cross_walkthrough.sh a          # Scenario A only (both methods)
+#   ./tpm_cross_walkthrough.sh b          # Scenario B only (both methods)
+#   ./tpm_cross_walkthrough.sh a-child    # Scenario A, child method only
+#   ./tpm_cross_walkthrough.sh a-primary  # Scenario A, primary method only
+#   ./tpm_cross_walkthrough.sh b-child    # Scenario B, child method only
+#   ./tpm_cross_walkthrough.sh b-primary  # Scenario B, primary method only
 #   PAUSE=1 ./tpm_cross_walkthrough.sh    # Pause between steps (press Enter)
 #
 
@@ -54,8 +64,6 @@ RUST_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # FDO NV index addresses (spec-defined)
 NV_DCTPM="0x01D10001"
-NV_HMAC_US="0x01D10003"
-NV_DK_US="0x01D10004"
 
 # Legacy indices (no longer written, but displayed if found during migration)
 NV_LEGACY_DC_ACTIVE="0x01D10000"
@@ -218,8 +226,6 @@ inspect_tpm_raw() {
     tpm2_getcap handles-nv-index 2>/dev/null | while read -r line; do
         case "$line" in
             *0x1D10001*|*0x1d10001*) echo -e "    $line  ${DIM}← DCTPM (consolidated CBOR credential blob)${NC}" ;;
-            *0x1D10003*|*0x1d10003*) echo -e "    $line  ${DIM}← HMAC_US (HMAC unique string, optional)${NC}" ;;
-            *0x1D10004*|*0x1d10004*) echo -e "    $line  ${DIM}← DeviceKey_US (device key unique string, optional)${NC}" ;;
             *0x1D10000*|*0x1d10000*) echo -e "    $line  ${YELLOW}← DCActive (LEGACY — should be removed)${NC}" ;;
             *0x1D10002*|*0x1d10002*) echo -e "    $line  ${YELLOW}← DCOV (LEGACY — should be removed)${NC}" ;;
             *0x1D10005*|*0x1d10005*) echo -e "    $line  ${YELLOW}← FDO_Cert (LEGACY — should be removed)${NC}" ;;
@@ -257,23 +263,6 @@ inspect_tpm_raw() {
         echo -e "    ${DIM}(not defined)${NC}"
     fi
 
-    step "HMAC_US NV ($NV_HMAC_US) — HMAC unique string (optional)"
-    if tpm2_nvread "$NV_HMAC_US" >/dev/null 2>&1; then
-        local hmac_size
-        hmac_size=$(tpm2_nvread "$NV_HMAC_US" 2>/dev/null | wc -c)
-        echo -e "    ${DIM}present ($hmac_size bytes)${NC}"
-    else
-        echo -e "    ${DIM}(not defined)${NC}"
-    fi
-
-    step "DeviceKey_US NV ($NV_DK_US) — device key unique string (optional)"
-    if tpm2_nvread "$NV_DK_US" >/dev/null 2>&1; then
-        local dk_size
-        dk_size=$(tpm2_nvread "$NV_DK_US" 2>/dev/null | wc -c)
-        echo -e "    ${DIM}present ($dk_size bytes)${NC}"
-    else
-        echo -e "    ${DIM}(not defined)${NC}"
-    fi
 
     step "DAK persistent key ($HANDLE_DAK)"
     show_cmd "tpm2_readpublic -c $HANDLE_DAK"
@@ -306,8 +295,8 @@ inspect_tpm_go() {
 
 inspect_tpm_prove() {
     section "DAK Possession Proof (Go tpm-prove)"
-    explain "Go signs a random challenge using the DAK with PolicyNV + PolicySecret auth."
-    explain "This proves the cross-implementation can use the same policy session."
+    explain "Go signs a random challenge using the DAK with empty authValue (null auth)."
+    explain "This proves the cross-implementation can use the same key templates."
     show_cmd "$GO_TPM_CLIENT client -tpm-prove -tpm-challenge 'walkthrough-cross-impl'"
     "$GO_TPM_CLIENT" client -tpm-prove -tpm-challenge "walkthrough-cross-impl" 2>&1 | while read -r line; do
         echo "    $line"
@@ -414,23 +403,28 @@ preflight() {
     info "NV Index Map (consolidated):"
     info "  0x01D10001  DCTPM         — Single CBOR blob: [Magic, Active, Version, DeviceInfo,"
     info "                               GUID, RvInfo, PubKeyHash, KeyType, DAKHandle, HMACHandle]"
-    info "  0x01D10003  HMAC_US       — HMAC unique string (32 bytes, optional)"
-    info "  0x01D10004  DeviceKey_US  — Device key unique string (64 bytes for P-256, optional)"
     info ""
     info "Persistent Handles:"
-    info "  0x81020002  DAK           — ECC signing key (PolicyNV + PolicySecret auth)"
-    info "  0x81020003  HMAC Key      — HMAC key (PolicyNV + PolicySecret auth)"
+    info "  0x81020002  DAK           — ECC signing key (userWithAuth=1, empty authValue)"
+    info "  0x81020003  HMAC Key      — HMAC key (userWithAuth=1, empty authValue)"
+    info ""
+    info "Key Creation Methods:"
+    info "  child   — Child key under deterministic SRK (WinPE-compatible, RNG-based)"
+    info "  primary — Primary key with unique string (rollback-resistant)"
+    info "  Both produce identical persistent keys — usage is the same."
 }
 
 # ===========================================================================
 # Scenario A:  Rust DI  -->  Go Onboard
 # ===========================================================================
 scenario_a() {
-    banner "Scenario A: Rust DI --> Go Onboard"
+    local method="${1:-child}"
+    banner "Scenario A ($method): Rust DI --> Go Onboard"
     echo -e "  ${BOLD}Rust manufacturing-client provisions the TPM during Device Initialization.${NC}"
     echo -e "  ${BOLD}Go client reads the TPM credentials and completes TO1 + TO2 onboarding.${NC}"
+    echo -e "  ${BOLD}Key creation method: ${CYAN}${method}${NC}"
     echo ""
-    echo -e "  Flow:  ${CYAN}[Rust DI] --writes--> [TPM NV] --reads--> [Go TO1/TO2]${NC}"
+    echo -e "  Flow:  ${CYAN}[Rust DI ($method)] --writes--> [TPM NV] --reads--> [Go TO1/TO2]${NC}"
     maybe_pause
 
     # -- Step 0: Clear TPM -------------------------------------------------
@@ -459,41 +453,45 @@ scenario_a() {
     maybe_pause
 
     # -- Step 2: Rust DI ----------------------------------------------------
-    section "Step 2: Rust Device Initialization (DI)"
-    explain "Rust manufacturing-client connects to the server and performs DI."
-    explain "With --key-ref tpm, all keys and credentials are stored in TPM NV."
-    explain ""
-    explain "What happens inside:"
-    explain "  1. Generate random DeviceKey_US and HMAC_US → write to NV Profile B"
-    explain "  2. Compute auth policies (PolicyNV + PolicySecret) from NV names"
-    explain "  3. Create ECC P-256 DAK with auth policy → persist to 0x81020002"
-    explain "  4. Create HMAC key with auth policy → persist to 0x81020003"
-    explain "  5. Send DI.AppStart to server (with FDO 2.0 CapabilityFlags)"
-    explain "  6. Receive DI.SetCredentials → write consolidated DCTPM NV (single CBOR blob)"
+    section "Step 2: Rust Device Initialization (DI) — method: $method"
+    if [ "$method" = "child" ]; then
+        explain "Creating keys as children of a deterministic SRK (WinPE-compatible)."
+        explain "  1. CreatePrimary (SRK under Owner hierarchy)"
+        explain "  2. Create child ECC P-256 DAK under SRK → Load → EvictControl to 0x81020002"
+        explain "  3. Create child HMAC key under SRK → Load → EvictControl to 0x81020003"
+        explain "  4. Flush SRK (not needed after keys are persisted)"
+    else
+        explain "Creating keys as primaries with random unique strings (rollback-resistant)."
+        explain "  1. Generate random unique strings"
+        explain "  2. CreatePrimary ECC P-256 DAK with unique string → EvictControl to 0x81020002"
+        explain "  3. CreatePrimary HMAC key with unique string → EvictControl to 0x81020003"
+    fi
+    explain "  Then: Send DI.AppStart to server → write consolidated DCTPM NV"
 
-    step "Run Rust DI"
+    step "Run Rust DI (--tpm-key-method $method)"
     export TSS2_TCTI="device:/dev/tpmrm0"
     export LD_LIBRARY_PATH="$(pwd)/target/lib:${LD_LIBRARY_PATH:-}"
     show_cmd "./target/release/fdo-manufacturing-client plain-di \\"
     show_cmd "    --manufacturing-server-url $SERVER_URL \\"
     show_cmd "    --mfg-string-type SerialNumber \\"
-    show_cmd "    --key-ref tpm \\"
+    show_cmd "    --key-ref tpm --tpm-key-method $method \\"
     show_cmd "    --fdo-version 200"
     echo ""
-    MANUFACTURING_INFO="walkthrough-rust-di" \
+    MANUFACTURING_INFO="walkthrough-rust-$method" \
     RUST_LOG=info \
     timeout 30 ./target/release/fdo-manufacturing-client plain-di \
         --manufacturing-server-url "$SERVER_URL" \
         --mfg-string-type SerialNumber \
         --key-ref tpm \
+        --tpm-key-method "$method" \
         --fdo-version 200 2>&1 | grep -v "WARNING:esys\|ERROR:esys\|ERROR tss_esapi\|Received TPM Error\|Error NV_ReadPublic\|Error TR From\|Error ReadPublic\|Closing handle\|Closing context\|Context closed" | grep -E "INFO|ERROR|error" | while read -r line; do
         echo "    $line"
     done
-    ok "Rust DI completed — credentials written to TPM"
+    ok "Rust DI completed ($method method) — credentials written to TPM"
     maybe_pause
 
     # -- Step 3: Inspect TPM (raw) ------------------------------------------
-    section "Step 3: Inspect TPM After Rust DI"
+    section "Step 3: Inspect TPM After Rust DI ($method)"
     explain "Verify that Rust wrote all expected NV indices and persistent keys."
     inspect_tpm_raw
     maybe_pause
@@ -511,9 +509,9 @@ scenario_a() {
 
     # -- Step 6: Go proves DAK possession ------------------------------------
     section "Step 5: Go Proves DAK Possession"
-    explain "Go opens a policy session (PolicyNV on DeviceKey_US + PolicySecret on"
-    explain "Endorsement hierarchy) and signs a challenge with the Rust-created DAK."
-    explain "This is the key cross-implementation test: can Go use Rust's policy?"
+    explain "Go signs a challenge with the Rust-created DAK using empty authValue."
+    explain "This is the key cross-implementation test: can Go use Rust's keys?"
+    explain "The key was created via $method method — but usage is identical."
     inspect_tpm_prove
     maybe_pause
 
@@ -523,8 +521,8 @@ scenario_a() {
     explain "  TO1:  HelloRV → HelloRVAck → ProveToRV (EAT) → RVRedirect"
     explain "  TO2:  HelloDeviceProbe(80) → ... → Done20(90) → DoneAck20(91)"
     explain ""
-    explain "The DAK signs protocol messages via TPM policy sessions."
-    explain "The HMAC key computes credential HMACs via TPM policy sessions."
+    explain "The DAK signs protocol messages via TPM with empty authValue."
+    explain "The HMAC key computes credential HMACs via TPM with empty authValue."
 
     step "Run Go onboard"
     show_cmd "$GO_TPM_CLIENT client -fdo-version 200"
@@ -542,18 +540,20 @@ scenario_a() {
 
     stop_server
 
-    banner "Scenario A Complete: Rust DI --> Go Onboard PASSED"
+    banner "Scenario A ($method) Complete: Rust DI --> Go Onboard PASSED"
 }
 
 # ===========================================================================
 # Scenario B:  Go DI  -->  Rust Onboard
 # ===========================================================================
 scenario_b() {
-    banner "Scenario B: Go DI --> Rust Onboard"
+    local method="${1:-child}"
+    banner "Scenario B ($method): Go DI --> Rust Onboard"
     echo -e "  ${BOLD}Go client provisions the TPM during Device Initialization.${NC}"
     echo -e "  ${BOLD}Rust client-linuxapp reads the TPM credentials and completes TO1 + TO2.${NC}"
+    echo -e "  ${BOLD}Key creation method: ${CYAN}${method}${NC}"
     echo ""
-    echo -e "  Flow:  ${CYAN}[Go DI] --writes--> [TPM NV] --reads--> [Rust TO1/TO2]${NC}"
+    echo -e "  Flow:  ${CYAN}[Go DI ($method)] --writes--> [TPM NV] --reads--> [Rust TO1/TO2]${NC}"
     maybe_pause
 
     # -- Step 0: Clear TPM -------------------------------------------------
@@ -582,32 +582,39 @@ scenario_b() {
     maybe_pause
 
     # -- Step 2: Go DI -------------------------------------------------------
-    section "Step 2: Go Device Initialization (DI)"
+    section "Step 2: Go Device Initialization (DI) — method: $method"
     explain "Go client performs DI with -di-key ec256 (P-256 curve)."
     explain "FDO_TPM_OWNER_HIERARCHY=1 is required on Linux because the"
     explain "Platform hierarchy is locked after boot."
-    explain ""
-    explain "What happens inside:"
-    explain "  1. Generate random DeviceKey_US and HMAC_US → write to NV Profile B"
-    explain "  2. Compute auth policies (PolicyNV + PolicySecret)"
-    explain "  3. Create ECC P-256 DAK → persist to 0x81020002"
-    explain "  4. Create HMAC key → persist to 0x81020003"
-    explain "  5. Send DI request to server, receive credential"
-    explain "  6. Write consolidated DCTPM NV (single CBOR blob with all credential data)"
+    if [ "$method" = "child" ]; then
+        explain ""
+        explain "FDO_TPM_KEY_METHOD=child (default):"
+        explain "  1. CreatePrimary (SRK under Owner hierarchy)"
+        explain "  2. Create child ECC P-256 DAK under SRK → Load → EvictControl to 0x81020002"
+        explain "  3. Create child HMAC key under SRK → Load → EvictControl to 0x81020003"
+    else
+        explain ""
+        explain "FDO_TPM_KEY_METHOD=primary:"
+        explain "  1. Generate random unique strings"
+        explain "  2. CreatePrimary ECC P-256 DAK with unique string → EvictControl to 0x81020002"
+        explain "  3. CreatePrimary HMAC key with unique string → EvictControl to 0x81020003"
+    fi
+    explain "  Then: Send DI request to server → write consolidated DCTPM NV"
 
-    step "Run Go DI"
+    step "Run Go DI (FDO_TPM_KEY_METHOD=$method)"
     export TSS2_TCTI="device:/dev/tpmrm0"
-    show_cmd "FDO_TPM_OWNER_HIERARCHY=1 $GO_TPM_CLIENT client -di $SERVER_URL -di-key ec256"
+    show_cmd "FDO_TPM_OWNER_HIERARCHY=1 FDO_TPM_KEY_METHOD=$method $GO_TPM_CLIENT client -di $SERVER_URL -di-key ec256"
     echo ""
     FDO_TPM_OWNER_HIERARCHY=1 \
+    FDO_TPM_KEY_METHOD="$method" \
     "$GO_TPM_CLIENT" client -di "$SERVER_URL" -di-key ec256 2>&1 | while read -r line; do
         echo "    $line"
     done
-    ok "Go DI completed — credentials written to TPM"
+    ok "Go DI completed ($method method) — credentials written to TPM"
     maybe_pause
 
     # -- Step 3: Inspect TPM (raw) ------------------------------------------
-    section "Step 3: Inspect TPM After Go DI"
+    section "Step 3: Inspect TPM After Go DI ($method)"
     explain "Verify that Go wrote all expected NV indices and persistent keys."
     inspect_tpm_raw
     maybe_pause
@@ -627,13 +634,13 @@ scenario_b() {
     # -- Step 6: Rust onboard (TO1 + TO2) -----------------------------------
     section "Step 6: Rust Onboards (TO1 + TO2) Using TPM Credentials"
     explain "Rust client-linuxapp reads the device credential from TPM NV."
-    explain "It uses the Go-created DAK and HMAC key via TPM policy sessions."
+    explain "It uses the Go-created DAK and HMAC key with empty authValue (null auth)."
     explain ""
     explain "The Rust client must correctly:"
     explain "  - Decode consolidated DCTPM CBOR blob written by Go"
     explain "  - Extract GUID, RvInfo, PubKeyHash, handle addresses"
-    explain "  - Open PolicyNV + PolicySecret sessions for DAK signing"
-    explain "  - Open PolicyNV + PolicySecret sessions for HMAC computation"
+    explain "  - Sign with DAK using empty authValue (null auth session)"
+    explain "  - Compute HMAC using HMAC key with empty authValue"
 
     step "Run Rust onboard"
     export LD_LIBRARY_PATH="$(pwd)/target/lib:${LD_LIBRARY_PATH:-}"
@@ -656,21 +663,25 @@ scenario_b() {
 
     stop_server
 
-    banner "Scenario B Complete: Go DI --> Rust Onboard PASSED"
+    banner "Scenario B ($method) Complete: Go DI --> Rust Onboard PASSED"
 }
 
 # ===========================================================================
 # Main
 # ===========================================================================
 main() {
-    local scenario="${1:-ab}"
+    local scenario="${1:-all}"
 
     banner "FDO 2.0 TPM Cross-Implementation Walkthrough"
     echo -e "  ${BOLD}Demonstrates Rust ←→ Go FDO 2.0 interoperability${NC}"
     echo -e "  ${BOLD}with hardware TPM-backed credential storage.${NC}"
     echo ""
-    echo -e "  Scenario A:  Rust DI  →  Go Onboard"
-    echo -e "  Scenario B:  Go DI    →  Rust Onboard"
+    echo -e "  Scenario A (child):   Rust DI (child method)   →  Go Onboard"
+    echo -e "  Scenario A (primary): Rust DI (primary method) →  Go Onboard"
+    echo -e "  Scenario B (child):   Go DI (child method)     →  Rust Onboard"
+    echo -e "  Scenario B (primary): Go DI (primary method)   →  Rust Onboard"
+    echo ""
+    echo -e "  Both methods produce identical persistent keys — usage is the same."
     echo ""
     info "Set PAUSE=1 to pause between steps."
     echo ""
@@ -680,23 +691,41 @@ main() {
     local pass=0
     local total=0
 
-    if [[ "$scenario" == *a* ]] || [ "$scenario" = "ab" ]; then
+    run_scenario() {
+        local name="$1"
+        shift
         total=$((total + 1))
-        if scenario_a; then
+        if "$@"; then
             pass=$((pass + 1))
         else
-            fail "Scenario A failed"
+            fail "$name failed"
         fi
-    fi
+    }
 
-    if [[ "$scenario" == *b* ]] || [ "$scenario" = "ab" ]; then
-        total=$((total + 1))
-        if scenario_b; then
-            pass=$((pass + 1))
-        else
-            fail "Scenario B failed"
-        fi
-    fi
+    case "$scenario" in
+        a-child)   run_scenario "A (child)"   scenario_a child ;;
+        a-primary) run_scenario "A (primary)" scenario_a primary ;;
+        b-child)   run_scenario "B (child)"   scenario_b child ;;
+        b-primary) run_scenario "B (primary)" scenario_b primary ;;
+        a)
+            run_scenario "A (child)"   scenario_a child
+            run_scenario "A (primary)" scenario_a primary
+            ;;
+        b)
+            run_scenario "B (child)"   scenario_b child
+            run_scenario "B (primary)" scenario_b primary
+            ;;
+        all|ab)
+            run_scenario "A (child)"   scenario_a child
+            run_scenario "A (primary)" scenario_a primary
+            run_scenario "B (child)"   scenario_b child
+            run_scenario "B (primary)" scenario_b primary
+            ;;
+        *)
+            echo "Usage: $0 [all|a|b|a-child|a-primary|b-child|b-primary]"
+            exit 1
+            ;;
+    esac
 
     echo ""
     banner "Summary: $pass / $total scenarios passed"

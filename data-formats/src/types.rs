@@ -2470,8 +2470,7 @@ impl COSESign {
         // Validate protected header algorithm
         let protected: aws_nitro_enclaves_cose::header_map::HeaderMap =
             serde_cbor::from_slice(&protected_bytes)?;
-        if let Some(serde_cbor::Value::Integer(alg)) =
-            protected.get(&serde_cbor::Value::Integer(1))
+        if let Some(serde_cbor::Value::Integer(alg)) = protected.get(&serde_cbor::Value::Integer(1))
         {
             if *alg != (sig_alg as i8 as i128) {
                 return Err(Error::InconsistentValue(

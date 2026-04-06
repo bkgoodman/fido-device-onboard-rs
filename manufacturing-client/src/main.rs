@@ -90,6 +90,11 @@ struct PlainDIArgs {
     #[clap(long)]
     key_ref: String,
 
+    /// TPM key creation method (only used when --key-ref tpm).
+    /// Available values: child (default, WinPE-compatible), primary (uses unique string).
+    #[clap(long, default_value = "child")]
+    tpm_key_method: String,
+
     /// FDO protocol version to use (101 for FDO 1.01, 110 for FDO 1.1, 200 for FDO 2.0)
     #[clap(long, default_value = "110")]
     fdo_version: u32,
@@ -446,7 +451,7 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                keyref = KeyReference::str_key(args.key_ref)
+                keyref = KeyReference::str_key(args.key_ref, &args.tpm_key_method)
                     .await
                     .context("Error determining key for DI")?;
 
@@ -816,17 +821,15 @@ enum KeyReference {
     SpecTpm {
         tss_context: Box<tss_esapi::Context>,
         /// Persistent DAK handle for signing.
+        #[allow(dead_code)]
         dak_handle: tss_esapi::handles::KeyHandle,
         /// Persistent HMAC key handle.
+        #[allow(dead_code)]
         hmac_handle: tss_esapi::handles::KeyHandle,
         /// Marshalled public key bytes.
         public_bytes: Vec<u8>,
         /// Whether to use Platform hierarchy for NV (vs Owner).
         use_platform: bool,
-        /// DeviceKey Unique String NV handle (for policy session auth).
-        dk_us_nv_handle: tss_esapi::handles::NvIndexHandle,
-        /// HMAC Unique String NV handle (for policy session auth).
-        hmac_us_nv_handle: tss_esapi::handles::NvIndexHandle,
     },
 }
 
@@ -1003,12 +1006,17 @@ impl KeyReference {
         })
     }
 
-    /// Spec-compliant TPM key generation: creates primary keys under Endorsement
-    /// hierarchy with unique strings, persists to spec-defined handles, provisions
-    /// NV indices for credential storage. No file written.
+    /// Spec-compliant TPM key creation.
+    ///
+    /// Supports two creation methods (same outcome — persistent key at handle):
+    /// - `use_child=true`:  Child key under SRK (WinPE-compatible, RNG-based)
+    /// - `use_child=false`: Primary key with unique string (rollback-resistant)
+    ///
+    /// Both produce: persistent ECC signing key at DAK_HANDLE and HMAC key at
+    /// HMAC_KEY_HANDLE, with userWithAuth=1, adminWithPolicy=1, empty authValue.
     #[cfg(feature = "tpm_support")]
-    async fn get_new_key_tpm_spec(keytype: PublicKeyType) -> Result<Self> {
-        use fdo_data_formats::tpm::{self, key, nv, policy};
+    async fn get_new_key_tpm_spec(keytype: PublicKeyType, use_child: bool) -> Result<Self> {
+        use fdo_data_formats::tpm::{self, key, nv};
 
         let mut ctx = tpm::open_context().context("Error opening TPM context")?;
         let use_platform = false; // Linux userspace: Platform hierarchy locked
@@ -1032,71 +1040,78 @@ impl KeyReference {
             _ => bail!("Unsupported key type for spec TPM: {:?}", keytype),
         };
 
-        // Step 3: Generate random unique strings
-        let dk_us_size = coord_size * 2; // X + Y
-        let mut device_key_us = vec![0u8; dk_us_size];
-        openssl::rand::rand_bytes(&mut device_key_us)
-            .context("Error generating device key unique string")?;
-        let mut hmac_us = [0u8; 32];
-        openssl::rand::rand_bytes(&mut hmac_us).context("Error generating HMAC unique string")?;
+        // Step 3: Create keys using the selected method
+        let public_bytes = if use_child {
+            // Approach 1: Child key under deterministic SRK (WinPE-compatible)
+            log::info!("Creating keys as children of SRK (child method)");
 
-        // Step 4: Define + write DeviceKey_US NV (Profile B)
-        let dk_us_handle = nv::define_nv_space(
-            &mut ctx,
-            tpm::DEVICE_KEY_US_INDEX,
-            dk_us_size,
-            tpm::NvProfile::B,
-            use_platform,
-        )
-        .context("Error defining DeviceKey_US NV")?;
-        nv::write_nv(&mut ctx, dk_us_handle, &device_key_us, tpm::NvProfile::B)
-            .context("Error writing DeviceKey_US NV")?;
-        log::debug!("Wrote DeviceKey_US NV ({} bytes)", dk_us_size);
+            let srk = key::create_srk(&mut ctx).context("Error creating SRK")?;
 
-        // Compute DAK auth policy AFTER writing (NV Name now includes WRITTEN flag).
-        // Both the trial session and runtime sessions see the same NV state.
-        let dk_policy = policy::compute_fdo_auth_policy(&mut ctx, dk_us_handle)
-            .context("Error computing DAK auth policy")?;
-        log::debug!("Computed DAK auth policy digest (after NV write)");
+            // Create + load + persist DAK
+            let (dak_priv, dak_pub) =
+                key::create_child_ec_key(&mut ctx, srk, curve, hash_alg)
+                    .context("Error creating child ECC key")?;
+            let dak_pub_bytes = tss_esapi::traits::Marshall::marshall(&dak_pub)
+                .context("Error marshalling DAK public")?;
+            let dak_loaded = key::load_child_key(&mut ctx, srk, dak_priv, dak_pub)
+                .context("Error loading child DAK")?;
+            key::persist_key(&mut ctx, dak_loaded, tpm::DAK_HANDLE)
+                .context("Error persisting DAK")?;
+            log::info!(
+                "DAK persisted to 0x{:08X} (child method, userWithAuth=true, adminWithPolicy=true)",
+                tpm::DAK_HANDLE
+            );
 
-        // Step 5: Define + write HMAC_US NV (Profile B)
-        let hmac_us_handle = nv::define_nv_space(
-            &mut ctx,
-            tpm::HMAC_US_INDEX,
-            32,
-            tpm::NvProfile::B,
-            use_platform,
-        )
-        .context("Error defining HMAC_US NV")?;
-        nv::write_nv(&mut ctx, hmac_us_handle, &hmac_us, tpm::NvProfile::B)
-            .context("Error writing HMAC_US NV")?;
-        log::debug!("Wrote HMAC_US NV (32 bytes)");
+            // Create + load + persist HMAC key
+            let (hmac_priv, hmac_pub) =
+                key::create_child_hmac_key(&mut ctx, srk)
+                    .context("Error creating child HMAC key")?;
+            let hmac_loaded = key::load_child_key(&mut ctx, srk, hmac_priv, hmac_pub)
+                .context("Error loading child HMAC key")?;
+            key::persist_key(&mut ctx, hmac_loaded, tpm::HMAC_KEY_HANDLE)
+                .context("Error persisting HMAC key")?;
+            log::info!(
+                "HMAC key persisted to 0x{:08X} (child method, userWithAuth=true, adminWithPolicy=true)",
+                tpm::HMAC_KEY_HANDLE
+            );
 
-        // Compute HMAC key auth policy AFTER writing
-        let hmac_policy = policy::compute_fdo_auth_policy(&mut ctx, hmac_us_handle)
-            .context("Error computing HMAC key auth policy")?;
-        log::debug!("Computed HMAC key auth policy digest (after NV write)");
+            // Flush the SRK - not needed after keys are persisted
+            let _ = ctx.flush_context(srk.into());
 
-        // Step 7: Create ECC signing key (DAK) with auth policy + persist
-        let (dak_transient, public_bytes) =
-            key::generate_spec_ec_key(&mut ctx, curve, hash_alg, &device_key_us, Some(&dk_policy))
-                .context("Error creating spec ECC key")?;
-        key::persist_key(&mut ctx, dak_transient, tpm::DAK_HANDLE)
-            .context("Error persisting DAK")?;
-        log::info!(
-            "DAK persisted to 0x{:08X} (userWithAuth=false)",
-            tpm::DAK_HANDLE
-        );
+            dak_pub_bytes
+        } else {
+            // Approach 2: Primary key with unique string (rollback-resistant)
+            log::info!("Creating keys as primaries with unique strings (primary method)");
 
-        // Step 8: Create HMAC key with auth policy + persist
-        let hmac_transient = key::generate_spec_hmac_key(&mut ctx, &hmac_us, Some(&hmac_policy))
-            .context("Error creating spec HMAC key")?;
-        key::persist_key(&mut ctx, hmac_transient, tpm::HMAC_KEY_HANDLE)
-            .context("Error persisting HMAC key")?;
-        log::info!(
-            "HMAC key persisted to 0x{:08X} (userWithAuth=false)",
-            tpm::HMAC_KEY_HANDLE
-        );
+            let dk_us_size = coord_size * 2; // X + Y
+            let mut device_key_us = vec![0u8; dk_us_size];
+            openssl::rand::rand_bytes(&mut device_key_us)
+                .context("Error generating device key unique string")?;
+            let mut hmac_us = [0u8; 32];
+            openssl::rand::rand_bytes(&mut hmac_us)
+                .context("Error generating HMAC unique string")?;
+
+            let (dak_transient, pub_bytes) =
+                key::generate_spec_ec_key(&mut ctx, curve, hash_alg, &device_key_us)
+                    .context("Error creating primary ECC key")?;
+            key::persist_key(&mut ctx, dak_transient, tpm::DAK_HANDLE)
+                .context("Error persisting DAK")?;
+            log::info!(
+                "DAK persisted to 0x{:08X} (primary method, userWithAuth=true, adminWithPolicy=true)",
+                tpm::DAK_HANDLE
+            );
+
+            let hmac_transient = key::generate_spec_hmac_key(&mut ctx, &hmac_us)
+                .context("Error creating primary HMAC key")?;
+            key::persist_key(&mut ctx, hmac_transient, tpm::HMAC_KEY_HANDLE)
+                .context("Error persisting HMAC key")?;
+            log::info!(
+                "HMAC key persisted to 0x{:08X} (primary method, userWithAuth=true, adminWithPolicy=true)",
+                tpm::HMAC_KEY_HANDLE
+            );
+
+            pub_bytes
+        };
 
         // Step 8: Define DCActive NV (Profile A), write 0x00 (DI in progress)
         let dc_active_handle = nv::define_nv_space(
@@ -1123,8 +1138,6 @@ impl KeyReference {
             hmac_handle,
             public_bytes,
             use_platform,
-            dk_us_nv_handle: dk_us_handle,
-            hmac_us_nv_handle: hmac_us_handle,
         })
     }
 
@@ -1197,12 +1210,12 @@ impl KeyReference {
             KeyStorageType::FileSystem => KeyReference::env_key_filesystem().await,
             #[cfg(feature = "tpm_support")]
             KeyStorageType::Tpm => {
-                // Try P-256 first (most broadly supported), fall back to P-384
-                match KeyReference::get_new_key_tpm_spec(PublicKeyType::SECP256R1).await {
+                // Default to child method when called from env (no CLI flag available)
+                match KeyReference::get_new_key_tpm_spec(PublicKeyType::SECP256R1, true).await {
                     Ok(keyref) => Ok(keyref),
                     Err(e) => {
                         log::info!("P-256 TPM key creation failed ({e:#}), trying P-384");
-                        KeyReference::get_new_key_tpm_spec(PublicKeyType::SECP384R1).await
+                        KeyReference::get_new_key_tpm_spec(PublicKeyType::SECP384R1, true).await
                     }
                 }
             }
@@ -1214,18 +1227,20 @@ impl KeyReference {
         }
     }
 
-    async fn str_key(key: String) -> Result<Self> {
+    async fn str_key(key: String, tpm_key_method: &str) -> Result<Self> {
         let key_storage_type = KeyStorageType::from_str(&key).context("Invalid sroage type")?;
+        let use_child = tpm_key_method != "primary";
         match key_storage_type {
             KeyStorageType::FileSystem => KeyReference::env_key_filesystem().await,
             #[cfg(feature = "tpm_support")]
             KeyStorageType::Tpm => {
                 // Use spec-compliant NV-based TPM storage
-                match KeyReference::get_new_key_tpm_spec(PublicKeyType::SECP256R1).await {
+                log::info!("TPM key creation method: {}", if use_child { "child (of SRK)" } else { "primary (with unique string)" });
+                match KeyReference::get_new_key_tpm_spec(PublicKeyType::SECP256R1, use_child).await {
                     Ok(keyref) => Ok(keyref),
                     Err(e) => {
                         log::info!("P-256 TPM key creation failed ({e:#}), trying P-384");
-                        KeyReference::get_new_key_tpm_spec(PublicKeyType::SECP384R1).await
+                        KeyReference::get_new_key_tpm_spec(PublicKeyType::SECP384R1, use_child).await
                     }
                 }
             }
@@ -1570,10 +1585,9 @@ impl KeyReference {
             }
             #[cfg(feature = "tpm_support")]
             KeyReference::SpecTpm {
-                ref mut tss_context,
-                dak_handle,
+                tss_context: _,
+                dak_handle: _,
                 public_bytes,
-                dk_us_nv_handle,
                 ..
             } => {
                 let signing_pub = tss_esapi::structures::Public::unmarshall(public_bytes)
@@ -1625,13 +1639,29 @@ impl KeyReference {
                 use openssl::hash::hash;
                 let tbs_hash = hash(digest, &tbs_bytes)?;
 
-                // Sign with persistent DAK using policy session via second ESYS connection
-                let (r, s) = fdo_data_formats::tpm::policy::sign_with_policy(
-                    fdo_data_formats::tpm::DEVICE_KEY_US_INDEX,
+                // Sign with persistent DAK using empty authValue (null auth)
+                let mut ctx = fdo_data_formats::tpm::open_context()
+                    .context("Error opening TPM context for CSR signing")?;
+                let dak_handle = fdo_data_formats::tpm::key::load_persistent_signing_key(
+                    &mut ctx,
                     fdo_data_formats::tpm::DAK_HANDLE,
+                )
+                .context("Error loading DAK for CSR signing")?;
+                let signature = fdo_data_formats::tpm::key::sign_with_persistent_key(
+                    &mut ctx,
+                    dak_handle,
                     tbs_hash.as_ref(),
                 )
                 .context("Error signing CSR with TPM DAK")?;
+
+                // Extract (r, s) from the EcDsa signature
+                let (r, s) = match signature {
+                    tss_esapi::structures::Signature::EcDsa(ecdsa_sig) => (
+                        ecdsa_sig.signature_r().to_vec(),
+                        ecdsa_sig.signature_s().to_vec(),
+                    ),
+                    _ => anyhow::bail!("Expected ECDSA signature from TPM"),
+                };
 
                 let sig_der = ecdsa_sig_to_der(&r, &s)?;
 
@@ -1726,57 +1756,11 @@ impl KeyReference {
                 // Write DCTPM NV: GUID (16 bytes) + DeviceInfo string
                 // Guid serialization: extract raw bytes via CBOR roundtrip
                 let guid_bytes = guid.serialize_data().context("Error serializing GUID")?;
-                // The CBOR-encoded GUID is a bstr; for NV we need raw 16 bytes.
-                // Use the serialized form directly (Go uses raw GUID bytes).
-                // Actually the Guid inner data is a Vec<u8> of 16 bytes.
-                // We can serialize to CBOR and extract, or just use the serialized GUID.
-                // For interop with Go: DCTPM = raw GUID (16 bytes) + DeviceInfo string.
-                // Let's extract the inner bytes by serializing to CBOR bstr and unwrapping.
-                let guid_raw: Vec<u8> = {
-                    let mut buf = Vec::new();
-                    ciborium::ser::into_writer(&guid, &mut buf)
-                        .context("Error CBOR-encoding GUID")?;
-                    // CBOR bstr: major type 2 + 16 bytes = [0x50, ...16 bytes...]
-                    if buf.len() >= 17 && buf[0] == 0x50 {
-                        buf[1..17].to_vec()
-                    } else {
-                        // Fallback: use the serialized data directly
-                        guid_bytes
-                    }
-                };
-                let mut dctpm_data = Vec::with_capacity(16 + device_info.len());
-                dctpm_data.extend_from_slice(&guid_raw[..std::cmp::min(guid_raw.len(), 16)]);
-                // Pad to 16 if shorter
-                while dctpm_data.len() < 16 {
-                    dctpm_data.push(0);
-                }
-                dctpm_data.extend_from_slice(device_info.as_bytes());
-
-                let dctpm_handle = nv::define_nv_space(
-                    &mut tss_context,
-                    tpm::DCTPM_INDEX,
-                    dctpm_data.len(),
-                    tpm::NvProfile::B,
-                    use_platform,
-                )
-                .context("Error defining DCTPM NV")?;
-                nv::write_nv(
-                    &mut tss_context,
-                    dctpm_handle,
-                    &dctpm_data,
-                    tpm::NvProfile::B,
-                )
-                .context("Error writing DCTPM NV")?;
-                log::info!(
-                    "Wrote DCTPM NV ({} bytes): GUID + DeviceInfo",
-                    dctpm_data.len()
-                );
-
-                // Write DCOV NV: CBOR array matching Go's dcovNVData encoding.
-                // Go encodes dcovNVData as CBOR array (not map): [version, rvinfo, pubkeyhash, keytype]
-                // Each element uses the FDO protocol's native CBOR encoding.
+                // Write consolidated DCTPM NV: CBOR map matching Go's dctpmNVData encoding.
+                // Go's keyasint CBOR library encodes structs as maps with integer keys:
+                //   {0: Magic, 1: Active, 2: Version, 3: DeviceInfo, 4: GUID,
+                //    5: RvInfo, 6: PubKeyHash, 7: KeyType, 8: DeviceKeyHandle, 9: HMACKeyHandle}
                 let key_type_value: u8 = {
-                    // Derive key type from public bytes
                     let pub_struct = tss_esapi::structures::Public::unmarshall(&public_bytes)
                         .context("Error unmarshalling public for key type")?;
                     match pub_struct {
@@ -1791,50 +1775,73 @@ impl KeyReference {
                     }
                 };
 
-                // Serialize DCOV as CBOR array matching Go's dcovNVData encoding:
-                // [version, rvinfo, pubkeyhash, keytype, hmac_handle]
-                // Go's custom CBOR library encodes structs as arrays (not maps),
-                // with field ordering determined by `keyasint` struct tags.
-                let dcov_payload = {
-                    let version_val = serde_cbor::Value::Integer(protocol_version as i128);
-                    let rvinfo_val = serde_cbor::value::to_value(&rvinfo)
-                        .unwrap_or(serde_cbor::Value::Array(vec![]));
-                    let hash_val =
-                        serde_cbor::value::to_value(&manufacturer_public_key_hash)
-                            .unwrap_or(serde_cbor::Value::Null);
-                    let keytype_val = serde_cbor::Value::Integer(key_type_value as i128);
-                    let hmac_handle_val =
-                        serde_cbor::Value::Integer(tpm::HMAC_KEY_HANDLE as i128);
-
-                    let dcov_array = serde_cbor::Value::Array(vec![
-                        version_val,
-                        rvinfo_val,
-                        hash_val,
-                        keytype_val,
-                        hmac_handle_val,
-                    ]);
-                    serde_cbor::to_vec(&dcov_array)
-                        .context("Error encoding DCOV CBOR array")?
+                let dctpm_magic: u32 = 0x46444F31; // "FDO1"
+                let proto_ver: u16 = match protocol_version {
+                    ProtocolVersion::Version2_0 => 200,
+                    ProtocolVersion::Version1_1 => 110,
+                    ProtocolVersion::Version1_0 => 101,
+                    _ => 200, // default to FDO 2.0
                 };
 
-                let dcov_handle = nv::define_nv_space(
+                // Extract raw GUID bytes (16 bytes)
+                let guid_raw: Vec<u8> = {
+                    let mut buf = Vec::new();
+                    ciborium::ser::into_writer(&guid, &mut buf)
+                        .context("Error CBOR-encoding GUID")?;
+                    // CBOR bstr: major type 2 + 16 bytes = [0x50, ...16 bytes...]
+                    if buf.len() >= 17 && buf[0] == 0x50 {
+                        buf[1..17].to_vec()
+                    } else {
+                        guid_bytes
+                    }
+                };
+
+                // Build consolidated DCTPM as CBOR array (matching Go keyasint encoding).
+                // Go's fxamacker/cbor encodes keyasint structs as arrays when keys
+                // are sequential from 0. Per spec CDDL: DCTPM = [Magic, Active, Version,
+                // DeviceInfo, GUID, RvInfo, PubKeyHash, KeyType, DeviceKeyHandle, HMACKeyHandle]
+                let dctpm_payload = {
+                    let dctpm_array = serde_cbor::Value::Array(vec![
+                        serde_cbor::Value::Integer(dctpm_magic as i128),       // [0] Magic
+                        serde_cbor::Value::Bool(true),                          // [1] Active
+                        serde_cbor::Value::Integer(proto_ver as i128),          // [2] Version
+                        serde_cbor::Value::Text(device_info.clone()),           // [3] DeviceInfo
+                        serde_cbor::Value::Bytes(guid_raw),                     // [4] GUID
+                        serde_cbor::value::to_value(&rvinfo)                    // [5] RvInfo
+                            .unwrap_or(serde_cbor::Value::Array(vec![])),
+                        serde_cbor::value::to_value(&manufacturer_public_key_hash) // [6] PubKeyHash
+                            .unwrap_or(serde_cbor::Value::Null),
+                        serde_cbor::Value::Integer(key_type_value as i128),     // [7] KeyType
+                        serde_cbor::Value::Integer(tpm::DAK_HANDLE as i128),   // [8] DeviceKeyHandle
+                        serde_cbor::Value::Integer(tpm::HMAC_KEY_HANDLE as i128), // [9] HMACKeyHandle
+                    ]);
+                    serde_cbor::to_vec(&dctpm_array)
+                        .context("Error encoding DCTPM CBOR array")?
+                };
+
+                let dctpm_handle = nv::define_nv_space(
                     &mut tss_context,
-                    tpm::DCOV_INDEX,
-                    dcov_payload.len(),
+                    tpm::DCTPM_INDEX,
+                    dctpm_payload.len(),
                     tpm::NvProfile::C,
                     use_platform,
                 )
-                .context("Error defining DCOV NV")?;
+                .context("Error defining DCTPM NV")?;
                 nv::write_nv(
                     &mut tss_context,
-                    dcov_handle,
-                    &dcov_payload,
+                    dctpm_handle,
+                    &dctpm_payload,
                     tpm::NvProfile::C,
                 )
-                .context("Error writing DCOV NV")?;
-                log::info!("Wrote DCOV NV ({} bytes)", dcov_payload.len());
+                .context("Error writing DCTPM NV")?;
+                log::info!(
+                    "Wrote consolidated DCTPM NV ({} bytes): Magic=0x{:08X}, Active=true, Version={}, KeyType={}, DAK=0x{:08X}, HMAC=0x{:08X}",
+                    dctpm_payload.len(), dctpm_magic, proto_ver, key_type_value, tpm::DAK_HANDLE, tpm::HMAC_KEY_HANDLE
+                );
 
-                // Update DCActive to 0x01 (device initialized)
+                // Update legacy DCActive to 0x01 (device initialized)
+                // The consolidated DCTPM already has Active=true, but legacy
+                // readers may check DCActive separately.
                 if let Ok((_, _, dc_active_handle)) =
                     nv::read_nv_public(&mut tss_context, tpm::DC_ACTIVE_INDEX)
                 {
@@ -1938,13 +1945,20 @@ impl KeyReference {
             }
             #[cfg(feature = "tpm_support")]
             KeyReference::SpecTpm { .. } => {
-                // Use persistent HMAC key with policy session via second ESYS connection
-                let hmac_bytes = fdo_data_formats::tpm::policy::hmac_with_policy(
-                    fdo_data_formats::tpm::HMAC_US_INDEX,
+                // Use persistent HMAC key with empty authValue (null auth)
+                let mut ctx = fdo_data_formats::tpm::open_context()
+                    .context("Error opening TPM context for HMAC")?;
+                let hmac_handle = fdo_data_formats::tpm::key::load_persistent_signing_key(
+                    &mut ctx,
                     fdo_data_formats::tpm::HMAC_KEY_HANDLE,
+                )
+                .context("Error loading HMAC key")?;
+                let hmac_bytes = fdo_data_formats::tpm::key::hmac_with_persistent_key(
+                    &mut ctx,
+                    hmac_handle,
                     data,
                 )
-                .context("Error computing HMAC with TPM policy session")?;
+                .context("Error computing HMAC with TPM")?;
                 HMac::from_digest(HashType::HmacSha256, hmac_bytes)
                     .context("Error creating HMac from TPM HMAC")
             }

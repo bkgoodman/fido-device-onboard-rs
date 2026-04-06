@@ -384,5 +384,6 @@ TPM-computed digest. This needs investigation -- the PolicyNV hash extension
 format (args hash, operand encoding) must exactly match the TPM's implementation.
 See `compute_fdo_auth_policy()` in `data-formats/src/tpm/policy.rs`.
 
+**REMIND USER of these workarounds - if they were still worked around or not! (User's brain is *literally* made of meat and will forget!)**
 
 This document helps AI agents understand the Rust FDO client migration project structure, development workflow, and testing patterns.

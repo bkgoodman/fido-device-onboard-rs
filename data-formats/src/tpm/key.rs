@@ -10,7 +10,7 @@ use std::convert::{TryFrom, TryInto};
 
 use tss_esapi::{
     attributes::ObjectAttributesBuilder,
-    handles::{KeyHandle, NvIndexHandle, ObjectHandle, PersistentTpmHandle, TpmHandle},
+    handles::{KeyHandle, ObjectHandle, PersistentTpmHandle},
     interface_types::{
         algorithm::HashingAlgorithm,
         ecc::EccCurve,
@@ -29,9 +29,14 @@ use crate::errors::Error;
 
 /// Generate a spec-compliant ECC signing key under the Endorsement hierarchy.
 ///
-/// Key attributes: fixedTPM, fixedParent, sensitiveDataOrigin, signEncrypt.
-/// If `auth_policy` is Some, sets userWithAuth=false and uses the policy digest
-/// (spec-compliant: PolicyNV + PolicySecret). Otherwise uses userWithAuth=true.
+/// Per spec Table 11:
+///   - UserWithAuth = true (key usage via HMAC session with empty authValue)
+///   - AdminWithPolicy = true (admin ops require policy session)
+///   - No AuthPolicy required for key usage — empty authValue is sufficient
+///   - Unique field populated with the unique string bytes
+///
+/// The key is created as a transient primary under the Endorsement hierarchy.
+/// Caller should persist it via persist_key().
 ///
 /// Returns (transient KeyHandle, marshalled Public bytes).
 pub fn generate_spec_ec_key(
@@ -39,22 +44,21 @@ pub fn generate_spec_ec_key(
     curve: EccCurve,
     hash_alg: HashingAlgorithm,
     unique_string: &[u8],
-    auth_policy: Option<&Digest>,
 ) -> Result<(KeyHandle, Vec<u8>), Error> {
     let coord_size = unique_string.len() / 2;
     let x_bytes = &unique_string[..coord_size];
     let y_bytes = &unique_string[coord_size..];
 
-    let use_policy = auth_policy.is_some();
     let obj_attrs = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
         .with_sensitive_data_origin(true)
         .with_sign_encrypt(true)
-        .with_user_with_auth(!use_policy) // false when policy is provided
+        .with_user_with_auth(true) // per spec Table 11: empty authValue for key usage
+        .with_admin_with_policy(true) // per spec Table 11: policy required for admin ops
         .build()?;
 
-    let mut builder = PublicBuilder::new()
+    let builder = PublicBuilder::new()
         .with_public_algorithm(tss_esapi::interface_types::algorithm::PublicAlgorithm::Ecc)
         .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
         .with_object_attributes(obj_attrs)
@@ -69,10 +73,6 @@ pub fn generate_spec_ec_key(
             tss_esapi::structures::EccParameter::try_from(y_bytes)?,
         ));
 
-    if let Some(policy) = auth_policy {
-        builder = builder.with_auth_policy(policy.clone());
-    }
-
     let template = builder.build()?;
 
     let result = ctx.execute_with_nullauth_session(|ctx| {
@@ -85,24 +85,24 @@ pub fn generate_spec_ec_key(
 
 /// Generate a spec-compliant HMAC key under the Endorsement hierarchy.
 ///
-/// If `auth_policy` is Some, sets userWithAuth=false (spec-compliant).
+/// Per spec Table 11:
+///   - UserWithAuth = true (key usage via HMAC session with empty authValue)
+///   - AdminWithPolicy = true (admin ops require policy session)
+///   - No AuthPolicy required for key usage — empty authValue is sufficient
+///   - Unique field populated with the unique string bytes
 ///
 /// Returns a transient KeyHandle.
-pub fn generate_spec_hmac_key(
-    ctx: &mut Context,
-    unique_string: &[u8],
-    auth_policy: Option<&Digest>,
-) -> Result<KeyHandle, Error> {
-    let use_policy = auth_policy.is_some();
+pub fn generate_spec_hmac_key(ctx: &mut Context, unique_string: &[u8]) -> Result<KeyHandle, Error> {
     let obj_attrs = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
         .with_sensitive_data_origin(true)
         .with_sign_encrypt(true)
-        .with_user_with_auth(!use_policy)
+        .with_user_with_auth(true) // per spec Table 11: empty authValue for key usage
+        .with_admin_with_policy(true) // per spec Table 11: policy required for admin ops
         .build()?;
 
-    let mut builder = PublicBuilder::new()
+    let builder = PublicBuilder::new()
         .with_public_algorithm(tss_esapi::interface_types::algorithm::PublicAlgorithm::KeyedHash)
         .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
         .with_object_attributes(obj_attrs)
@@ -111,10 +111,6 @@ pub fn generate_spec_hmac_key(
         }))
         .with_keyed_hash_unique_identifier(Digest::try_from(unique_string)?);
 
-    if let Some(policy) = auth_policy {
-        builder = builder.with_auth_policy(policy.clone());
-    }
-
     let template = builder.build()?;
 
     let result = ctx.execute_with_nullauth_session(|ctx| {
@@ -122,6 +118,137 @@ pub fn generate_spec_hmac_key(
     })?;
 
     Ok(result.key_handle)
+}
+
+// =========================================================================
+// Child key creation (Approach 1: child of deterministic SRK)
+// =========================================================================
+
+/// Create a deterministic Storage Root Key (SRK) under the given hierarchy.
+///
+/// Uses the TCG-standard SRK template (RSA 2048, null symmetric, null scheme,
+/// empty unique). This produces the same SRK every time on the same TPM
+/// (deterministic from the hierarchy seed).
+///
+/// Returns a transient KeyHandle. Caller should flush after use.
+pub fn create_srk(ctx: &mut Context) -> Result<KeyHandle, Error> {
+    let obj_attrs = ObjectAttributesBuilder::new()
+        .with_fixed_tpm(true)
+        .with_fixed_parent(true)
+        .with_sensitive_data_origin(true)
+        .with_user_with_auth(true)
+        .with_restricted(true)
+        .with_decrypt(true)
+        .build()?;
+
+    let template = PublicBuilder::new()
+        .with_public_algorithm(tss_esapi::interface_types::algorithm::PublicAlgorithm::Rsa)
+        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_object_attributes(obj_attrs)
+        .with_rsa_parameters(tss_esapi::structures::PublicRsaParameters::new(
+            tss_esapi::structures::SymmetricDefinitionObject::AES_128_CFB,
+            tss_esapi::structures::RsaScheme::Null,
+            tss_esapi::interface_types::key_bits::RsaKeyBits::Rsa2048,
+            tss_esapi::structures::RsaExponent::default(),
+        ))
+        .with_rsa_unique_identifier(tss_esapi::structures::PublicKeyRsa::default())
+        .build()?;
+
+    let result = ctx.execute_with_nullauth_session(|ctx| {
+        ctx.create_primary(Hierarchy::Owner, template, None, None, None, None)
+    })?;
+
+    Ok(result.key_handle)
+}
+
+/// Create an ECC signing key as a child of the given parent (SRK).
+///
+/// The child key is generated from the TPM's RNG (sensitiveDataOrigin=1),
+/// so each call produces a unique, unpredictable key.
+///
+/// Returns (transient KeyHandle, marshalled Public bytes).
+/// The caller must load and persist the key separately.
+pub fn create_child_ec_key(
+    ctx: &mut Context,
+    parent: KeyHandle,
+    curve: EccCurve,
+    hash_alg: HashingAlgorithm,
+) -> Result<(tss_esapi::structures::Private, tss_esapi::structures::Public), Error> {
+    let obj_attrs = ObjectAttributesBuilder::new()
+        .with_fixed_tpm(true)
+        .with_fixed_parent(true)
+        .with_sensitive_data_origin(true)
+        .with_sign_encrypt(true)
+        .with_user_with_auth(true)         // per spec Table 11
+        .with_admin_with_policy(true)      // per spec Table 11
+        .build()?;
+
+    let template = PublicBuilder::new()
+        .with_public_algorithm(tss_esapi::interface_types::algorithm::PublicAlgorithm::Ecc)
+        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_object_attributes(obj_attrs)
+        .with_ecc_parameters(PublicEccParameters::new(
+            SymmetricDefinitionObject::Null,
+            EccScheme::EcDsa(HashScheme::new(hash_alg)),
+            curve,
+            KeyDerivationFunctionScheme::Null,
+        ))
+        .with_ecc_unique_identifier(tss_esapi::structures::EccPoint::default())
+        .build()?;
+
+    let result = ctx.execute_with_nullauth_session(|ctx| {
+        ctx.create(parent, template, None, None, None, None)
+    })?;
+
+    Ok((result.out_private, result.out_public))
+}
+
+/// Create an HMAC key as a child of the given parent (SRK).
+///
+/// The child key is generated from the TPM's RNG (sensitiveDataOrigin=1).
+///
+/// Returns (Private blob, Public blob) for loading.
+pub fn create_child_hmac_key(
+    ctx: &mut Context,
+    parent: KeyHandle,
+) -> Result<(tss_esapi::structures::Private, tss_esapi::structures::Public), Error> {
+    let obj_attrs = ObjectAttributesBuilder::new()
+        .with_fixed_tpm(true)
+        .with_fixed_parent(true)
+        .with_sensitive_data_origin(true)
+        .with_sign_encrypt(true)
+        .with_user_with_auth(true)         // per spec Table 11
+        .with_admin_with_policy(true)      // per spec Table 11
+        .build()?;
+
+    let template = PublicBuilder::new()
+        .with_public_algorithm(tss_esapi::interface_types::algorithm::PublicAlgorithm::KeyedHash)
+        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_object_attributes(obj_attrs)
+        .with_keyed_hash_parameters(PublicKeyedHashParameters::new(KeyedHashScheme::Hmac {
+            hmac_scheme: HmacScheme::new(HashingAlgorithm::Sha256),
+        }))
+        .with_keyed_hash_unique_identifier(Digest::default())
+        .build()?;
+
+    let result = ctx.execute_with_nullauth_session(|ctx| {
+        ctx.create(parent, template, None, None, None, None)
+    })?;
+
+    Ok((result.out_private, result.out_public))
+}
+
+/// Load a child key (Private + Public) under its parent, returning a transient handle.
+pub fn load_child_key(
+    ctx: &mut Context,
+    parent: KeyHandle,
+    private: tss_esapi::structures::Private,
+    public: tss_esapi::structures::Public,
+) -> Result<KeyHandle, Error> {
+    let handle = ctx.execute_with_nullauth_session(|ctx| {
+        ctx.load(parent, private, public)
+    })?;
+    Ok(handle.into())
 }
 
 /// Persist a transient key to a permanent handle via TPM2_EvictControl.
@@ -181,15 +308,14 @@ pub fn load_persistent_signing_key(ctx: &mut Context, handle: u32) -> Result<Key
     Ok(object_handle.into())
 }
 
-/// Sign a digest using a persistent key handle with policy session authorization.
+/// Sign a digest using a persistent key handle with empty authValue.
 ///
-/// If `us_nv_handle` is Some, uses PolicyNV+PolicySecret session (spec-compliant).
-/// Otherwise falls back to null auth (password).
+/// Per spec Table 11, keys have userWithAuth=1 with empty authValue, so
+/// signing requires only an empty password auth session (null auth).
 pub fn sign_with_persistent_key(
     ctx: &mut Context,
     key_handle: KeyHandle,
     digest: &[u8],
-    us_nv_handle: Option<NvIndexHandle>,
 ) -> Result<tss_esapi::structures::Signature, Error> {
     let tpm_digest = Digest::try_from(digest)?;
     let validation: tss_esapi::structures::HashcheckTicket =
@@ -200,54 +326,32 @@ pub fn sign_with_persistent_key(
         }
         .try_into()?;
 
-    if let Some(us_handle) = us_nv_handle {
-        // Use policy session
-        let (_, auth_session) = super::policy::create_fdo_key_policy_session(ctx, us_handle)?;
-        ctx.execute_with_session(Some(auth_session), |ctx| {
-            ctx.sign(
-                key_handle,
-                tpm_digest,
-                tss_esapi::structures::SignatureScheme::Null,
-                validation,
-            )
-        })
-        .map_err(Error::from)
-    } else {
-        ctx.execute_with_nullauth_session(|ctx| {
-            ctx.sign(
-                key_handle,
-                tpm_digest,
-                tss_esapi::structures::SignatureScheme::Null,
-                validation,
-            )
-        })
-        .map_err(Error::from)
-    }
+    ctx.execute_with_nullauth_session(|ctx| {
+        ctx.sign(
+            key_handle,
+            tpm_digest,
+            tss_esapi::structures::SignatureScheme::Null,
+            validation,
+        )
+    })
+    .map_err(Error::from)
 }
 
-/// Compute HMAC using a persistent HMAC key handle with policy session authorization.
+/// Compute HMAC using a persistent HMAC key handle with empty authValue.
 ///
-/// If `us_nv_handle` is Some, uses PolicyNV+PolicySecret session (spec-compliant).
+/// Per spec Table 11, keys have userWithAuth=1 with empty authValue, so
+/// HMAC requires only an empty password auth session (null auth).
 pub fn hmac_with_persistent_key(
     ctx: &mut Context,
     key_handle: KeyHandle,
     data: &[u8],
-    us_nv_handle: Option<NvIndexHandle>,
 ) -> Result<Vec<u8>, Error> {
     let buffer = tss_esapi::structures::MaxBuffer::try_from(data)?;
 
-    if let Some(us_handle) = us_nv_handle {
-        let (_, auth_session) = super::policy::create_fdo_key_policy_session(ctx, us_handle)?;
-        let result = ctx.execute_with_session(Some(auth_session), |ctx| {
-            ctx.hmac(key_handle.into(), buffer, HashingAlgorithm::Sha256)
-        })?;
-        Ok(result.to_vec())
-    } else {
-        let result = ctx.execute_with_nullauth_session(|ctx| {
-            ctx.hmac(key_handle.into(), buffer, HashingAlgorithm::Sha256)
-        })?;
-        Ok(result.to_vec())
-    }
+    let result = ctx.execute_with_nullauth_session(|ctx| {
+        ctx.hmac(key_handle.into(), buffer, HashingAlgorithm::Sha256)
+    })?;
+    Ok(result.to_vec())
 }
 
 /// Extract the public key from TPM Public structure as DER bytes.

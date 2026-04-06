@@ -12,6 +12,7 @@
 pub mod credential;
 pub mod key;
 pub mod nv;
+#[allow(dead_code, unused_imports, clippy::all)]
 pub mod policy;
 
 use std::str::FromStr;
@@ -29,13 +30,9 @@ use crate::errors::Error;
 pub const DC_ACTIVE_INDEX: u32 = 0x01D1_0000;
 /// DCTPM: GUID (16 bytes) + DeviceInfo string.
 pub const DCTPM_INDEX: u32 = 0x01D1_0001;
-/// DCOV: CBOR-encoded credential metadata (version, RvInfo, PubKeyHash, KeyType).
+/// DCOV: CBOR-encoded credential metadata (legacy, replaced by consolidated DCTPM).
 pub const DCOV_INDEX: u32 = 0x01D1_0002;
-/// HMAC Unique String: 32 bytes random seed for HMAC key derivation.
-pub const HMAC_US_INDEX: u32 = 0x01D1_0003;
-/// Device Key Unique String: 64 bytes (P-256) or 96 bytes (P-384) for key derivation.
-pub const DEVICE_KEY_US_INDEX: u32 = 0x01D1_0004;
-/// FDO Certificate (optional, not used in production).
+/// FDO Certificate (legacy, not used).
 pub const FDO_CERT_INDEX: u32 = 0x01D1_0005;
 
 // ============================================================

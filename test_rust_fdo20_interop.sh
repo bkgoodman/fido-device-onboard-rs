@@ -584,9 +584,9 @@ test_tpm_rust_di_go_onboard() {
 	/tmp/fdo-tpm-client client -tpm-show || return 1
 	log_success "Go can read Rust-provisioned TPM NV"
 
-	log_step "Step 3: Go tpm-prove (verify DAK policy compatibility)"
+	log_step "Step 3: Go tpm-prove (verify DAK possession with empty authValue)"
 	/tmp/fdo-tpm-client client -tpm-prove || return 1
-	log_success "Go can use Rust-created DAK with policy session"
+	log_success "Go can use Rust-created DAK with empty authValue"
 
 	log_step "Step 4: Go onboard (TO1 + TO2)"
 	/tmp/fdo-tpm-client client -fdo-version 200 || return 1
