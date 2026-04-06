@@ -81,6 +81,7 @@ const TPM2_EO_UNSIGNED_GE: u16 = tss_esapi::constants::tss::TPM2_EO_UNSIGNED_GE 
 /// what the TPM will expect at runtime.
 ///
 /// Policy: PolicyNV(US_NV, offset=0, operand=0x00, UnsignedGE) + PolicySecret(US_NV)
+#[deprecated(note = "Legacy: current spec uses userWithAuth=1 with empty authValue. No policy session needed.")]
 pub fn compute_fdo_auth_policy(
     _ctx: &mut Context,
     us_nv_handle: NvIndexHandle,

@@ -1113,20 +1113,7 @@ impl KeyReference {
             pub_bytes
         };
 
-        // Step 8: Define DCActive NV (Profile A), write 0x00 (DI in progress)
-        let dc_active_handle = nv::define_nv_space(
-            &mut ctx,
-            tpm::DC_ACTIVE_INDEX,
-            1,
-            tpm::NvProfile::A,
-            use_platform,
-        )
-        .context("Error defining DCActive NV")?;
-        nv::write_nv(&mut ctx, dc_active_handle, &[0x00], tpm::NvProfile::A)
-            .context("Error writing DCActive NV")?;
-        log::debug!("DCActive set to 0x00 (DI in progress)");
-
-        // Step 9: Load persistent handles for use during DI protocol
+        // Step 8: Load persistent handles for use during DI protocol
         let dak_handle = key::load_persistent_signing_key(&mut ctx, tpm::DAK_HANDLE)
             .context("Error loading persistent DAK")?;
         let hmac_handle = key::load_persistent_signing_key(&mut ctx, tpm::HMAC_KEY_HANDLE)
@@ -1823,7 +1810,7 @@ impl KeyReference {
                     &mut tss_context,
                     tpm::DCTPM_INDEX,
                     dctpm_payload.len(),
-                    tpm::NvProfile::C,
+                    tpm::NvProfile::Dctpm,
                     use_platform,
                 )
                 .context("Error defining DCTPM NV")?;
@@ -1831,7 +1818,7 @@ impl KeyReference {
                     &mut tss_context,
                     dctpm_handle,
                     &dctpm_payload,
-                    tpm::NvProfile::C,
+                    tpm::NvProfile::Dctpm,
                 )
                 .context("Error writing DCTPM NV")?;
                 log::info!(
@@ -1839,22 +1826,7 @@ impl KeyReference {
                     dctpm_payload.len(), dctpm_magic, proto_ver, key_type_value, tpm::DAK_HANDLE, tpm::HMAC_KEY_HANDLE
                 );
 
-                // Update legacy DCActive to 0x01 (device initialized)
-                // The consolidated DCTPM already has Active=true, but legacy
-                // readers may check DCActive separately.
-                if let Ok((_, _, dc_active_handle)) =
-                    nv::read_nv_public(&mut tss_context, tpm::DC_ACTIVE_INDEX)
-                {
-                    nv::write_nv(
-                        &mut tss_context,
-                        dc_active_handle,
-                        &[0x01],
-                        tpm::NvProfile::A,
-                    )
-                    .context("Error updating DCActive to 0x01")?;
-                }
-                log::info!("DCActive set to 0x01 (device initialized)");
-                log::info!("Credentials stored in TPM NV indices (no file written)");
+                log::info!("Credentials stored in consolidated DCTPM NV index (no file written)");
 
                 Ok(())
             }

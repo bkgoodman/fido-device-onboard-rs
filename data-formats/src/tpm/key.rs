@@ -60,7 +60,7 @@ pub fn generate_spec_ec_key(
 
     let builder = PublicBuilder::new()
         .with_public_algorithm(tss_esapi::interface_types::algorithm::PublicAlgorithm::Ecc)
-        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_name_hashing_algorithm(hash_alg)
         .with_object_attributes(obj_attrs)
         .with_ecc_parameters(PublicEccParameters::new(
             SymmetricDefinitionObject::Null,
@@ -185,7 +185,7 @@ pub fn create_child_ec_key(
 
     let template = PublicBuilder::new()
         .with_public_algorithm(tss_esapi::interface_types::algorithm::PublicAlgorithm::Ecc)
-        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_name_hashing_algorithm(hash_alg)
         .with_object_attributes(obj_attrs)
         .with_ecc_parameters(PublicEccParameters::new(
             SymmetricDefinitionObject::Null,

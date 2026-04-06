@@ -19,8 +19,8 @@ use tss_esapi::{
 use crate::errors::Error;
 
 use super::{
-    NvProfile, DAK_HANDLE, DCOV_INDEX, DCTPM_INDEX, DC_ACTIVE_INDEX,
-    FDO_CERT_INDEX, HMAC_KEY_HANDLE,
+    NvProfile, DCTPM_INDEX, DAK_HANDLE, HMAC_KEY_HANDLE,
+    LEGACY_DC_ACTIVE_INDEX, LEGACY_DCOV_INDEX, LEGACY_FDO_CERT_INDEX,
 };
 
 /// Information read from TPM NV credential indices.
@@ -42,8 +42,8 @@ pub struct NvCredentialInfo {
 
 /// Build NV index attributes for a given profile.
 ///
-/// If `use_platform` is false, Profile A/B indices use Owner hierarchy
-/// instead of Platform (for Linux userspace where Platform is locked).
+/// DCTPM profile: Owner+Auth R/W, NoDA, PlatformCreate if available.
+/// LegacyB profile: same attributes (retained for cleanup compatibility).
 fn build_nv_attrs(
     profile: NvProfile,
     use_platform: bool,
@@ -51,38 +51,13 @@ fn build_nv_attrs(
     let mut builder = NvIndexAttributesBuilder::new();
 
     match profile {
-        NvProfile::A => {
+        NvProfile::Dctpm | NvProfile::LegacyB => {
             builder = builder
                 .with_owner_write(true)
                 .with_auth_write(true)
                 .with_owner_read(true)
                 .with_auth_read(true)
                 .with_no_da(true);
-            if use_platform {
-                builder = builder.with_platform_create(true);
-            }
-        }
-        NvProfile::B => {
-            // Profile B (Unique Strings): per Go NVProfileB
-            builder = builder
-                .with_owner_write(true)
-                .with_auth_write(true)
-                .with_owner_read(true)
-                .with_auth_read(true)
-                .with_no_da(true);
-            if use_platform {
-                builder = builder.with_platform_create(true);
-            }
-        }
-        NvProfile::C => {
-            // Profile C (DCTPM, DCOV): per Go NVProfileDCTPM
-            builder = builder
-                .with_owner_write(true)
-                .with_auth_write(true)
-                .with_owner_read(true)
-                .with_auth_read(true)
-                .with_no_da(true);
-            // Profile C: no PlatformCreate (survives TPM2_Clear only if Platform)
             if use_platform {
                 builder = builder.with_platform_create(true);
             }
@@ -93,25 +68,17 @@ fn build_nv_attrs(
 }
 
 /// Auth handle for NV define operations.
-fn define_auth(profile: NvProfile, use_platform: bool) -> Provision {
-    match profile {
-        NvProfile::A | NvProfile::B => {
-            if use_platform {
-                Provision::Platform
-            } else {
-                Provision::Owner
-            }
-        }
-        NvProfile::C => Provision::Owner,
+fn define_auth(_profile: NvProfile, use_platform: bool) -> Provision {
+    if use_platform {
+        Provision::Platform
+    } else {
+        Provision::Owner
     }
 }
 
 /// Auth handle for NV read/write operations.
-fn rw_auth(profile: NvProfile, _nv_handle: NvIndexHandle) -> NvAuth {
-    // All profiles use Owner auth for read/write (matching Go implementation)
-    match profile {
-        NvProfile::A | NvProfile::B | NvProfile::C => NvAuth::Owner,
-    }
+fn rw_auth(_profile: NvProfile, _nv_handle: NvIndexHandle) -> NvAuth {
+    NvAuth::Owner
 }
 
 // ============================================================
@@ -201,12 +168,13 @@ pub fn undefine_nv_space(ctx: &mut Context, index: u32, use_platform: bool) {
 pub fn cleanup_fdo_state(ctx: &mut Context, use_platform: bool) {
     // Clean up current and legacy NV indices
     for index in &[
-        DC_ACTIVE_INDEX,
         DCTPM_INDEX,
-        DCOV_INDEX,
-        FDO_CERT_INDEX,
-        0x01D1_0003, // legacy HMAC_US (no longer used)
-        0x01D1_0004, // legacy DeviceKey_US (no longer used)
+        // Legacy indices from old multi-NV model
+        LEGACY_DC_ACTIVE_INDEX,
+        LEGACY_DCOV_INDEX,
+        LEGACY_FDO_CERT_INDEX,
+        0x01D1_0003, // legacy HMAC_US
+        0x01D1_0004, // legacy DeviceKey_US
     ] {
         undefine_nv_space(ctx, *index, use_platform);
     }
@@ -220,8 +188,6 @@ pub fn cleanup_fdo_state(ctx: &mut Context, use_platform: bool) {
 /// Reads the consolidated DCTPM NV index (0x01D10001) which contains a CBOR
 /// array: [Magic, Active, Version, DeviceInfo, GUID, RvInfo, PubKeyHash,
 /// KeyType, DeviceKeyHandle, HMACKeyHandle].
-///
-/// Falls back to legacy DCActive (0x01D10000) if consolidated DCTPM is absent.
 pub fn read_nv_credentials(ctx: &mut Context) -> Result<NvCredentialInfo, Error> {
     let mut info = NvCredentialInfo {
         has_dctpm: false,
@@ -232,10 +198,10 @@ pub fn read_nv_credentials(ctx: &mut Context) -> Result<NvCredentialInfo, Error>
         has_hmac_key: false,
     };
 
-    // Try consolidated DCTPM (Profile C: OwnerRead)
+    // Read consolidated DCTPM (OwnerRead)
     if let Ok((nv_public, _, nv_handle)) = read_nv_public(ctx, DCTPM_INDEX) {
         let size = nv_public.data_size() as u16;
-        if let Ok(data) = read_nv(ctx, nv_handle, size, NvProfile::C) {
+        if let Ok(data) = read_nv(ctx, nv_handle, size, NvProfile::Dctpm) {
             if !data.is_empty() {
                 info.raw_dctpm = data;
                 info.has_dctpm = true;
@@ -253,16 +219,6 @@ pub fn read_nv_credentials(ctx: &mut Context) -> Result<NvCredentialInfo, Error>
                         }
                     }
                 }
-            }
-        }
-    }
-
-    // Fallback: check legacy DCActive (0x01D10000) if DCTPM not found or not active
-    if !info.has_dctpm {
-        if let Ok((nv_public, _, nv_handle)) = read_nv_public(ctx, DC_ACTIVE_INDEX) {
-            let size = nv_public.data_size() as u16;
-            if let Ok(data) = read_nv(ctx, nv_handle, size, NvProfile::A) {
-                info.active = !data.is_empty() && data[0] == 0x01;
             }
         }
     }

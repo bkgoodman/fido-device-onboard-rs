@@ -23,7 +23,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Configuration
-EPHEMERAL_DIR="ephemeral-test-files"
+EPHEMERAL_DIR="$(pwd)/ephemeral-test-files"
 DB_FILE="$EPHEMERAL_DIR/test.db"
 CRED_FILE="$EPHEMERAL_DIR/cred.bin"
 DI_SIGN_KEY="$EPHEMERAL_DIR/di_sign_key.der"
@@ -62,7 +62,7 @@ log_info() { echo -e "${CYAN}    $1${NC}"; }
 
 run_cmd() {
 	echo -e "${YELLOW}\$ $*${NC}"
-	timeout 30 "$@" || { log_error "Command failed (or timed out): $*"; return 1; }
+	timeout 120 "$@" || { log_error "Command failed (or timed out): $*"; return 1; }
 }
 
 # Start Go FDO server
@@ -85,13 +85,13 @@ start_go_server() {
 
 	log_info "Starting server process..."
 	# shellcheck disable=SC2086
-	(cd "$GO_FDO_DIR/examples" && go run ./cmd server -http "$SERVER_ADDR" -ext-http "$SERVER_ADDR" -db "../../fido-device-onboard-rs/$DB_FILE" $flags >/tmp/fdo_server.log 2>&1) &
+	(cd "$GO_FDO_DIR/examples" && go run ./cmd server -http "$SERVER_ADDR" -ext-http "$SERVER_ADDR" -db "$DB_FILE" $flags >$EPHEMERAL_DIR/fdo_server.log 2>&1) &
 	SERVER_PID=$!
 
 	log_info "Waiting for server to start (PID: $SERVER_PID)..."
 	local retries=15
 	while [ $retries -gt 0 ]; do
-		if grep -q "Listening" /tmp/fdo_server.log 2>/dev/null; then
+		if grep -q "Listening" $EPHEMERAL_DIR/fdo_server.log 2>/dev/null; then
 			sleep 0.5
 			if nc -z 127.0.0.1 9999 2>/dev/null || (echo >/dev/tcp/127.0.0.1/9999) 2>/dev/null; then
 				log_success "Server started and listening on $SERVER_ADDR"
@@ -100,14 +100,14 @@ start_go_server() {
 		fi
 		if ! kill -0 "$SERVER_PID" 2>/dev/null; then
 			log_error "Server process died"
-			cat /tmp/fdo_server.log 2>/dev/null || true
+			cat $EPHEMERAL_DIR/fdo_server.log 2>/dev/null || true
 			return 1
 		fi
 		sleep 1
 		retries=$((retries - 1))
 	done
 	log_error "Server failed to start within timeout"
-	cat /tmp/fdo_server.log 2>/dev/null || true
+	cat $EPHEMERAL_DIR/fdo_server.log 2>/dev/null || true
 	return 1
 }
 
@@ -200,7 +200,7 @@ test_full_fdo20() {
 	log_section "TEST: Full FDO 2.0 Flow (DI + TO1 + TO2)"
 	log_info "Rust client performs DI, TO1, and TO2 against Go server"
 
-	rm -f "$DB_FILE" "$CRED_FILE" /tmp/fdo_onboard_marker_test
+	rm -f "$DB_FILE" "$CRED_FILE" $EPHEMERAL_DIR/fdo_onboard_marker_test
 	generate_di_keys
 	start_go_server "-reuse-cred" || return 1
 
@@ -218,7 +218,7 @@ test_full_fdo20() {
 
 	log_step "Step 2: TO1 + TO2 with Rust client"
 	DEVICE_CREDENTIAL="$CRED_FILE" \
-	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=/tmp/fdo_onboard_marker_test \
+	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=$EPHEMERAL_DIR/fdo_onboard_marker_test \
 	ALLOW_NONINTEROPERABLE_KDF=1 \
 	run_cmd ./target/release/fdo-client-linuxapp || return 1
 	log_success "TO1 + TO2 completed"
@@ -234,14 +234,14 @@ test_delegate() {
 	log_section "TEST: Delegate Certificate Support"
 	log_info "Tests TO2 with delegate-signed ProveOVHdr20"
 
-	rm -f "$DB_FILE" "$CRED_FILE" /tmp/fdo_onboard_marker_delegate
+	rm -f "$DB_FILE" "$CRED_FILE" $EPHEMERAL_DIR/fdo_onboard_marker_delegate
 	generate_di_keys
 
 	log_step "Step 1: Initialize server with owner certs"
-	(cd "$GO_FDO_DIR/examples" && go run ./cmd server -http "$SERVER_ADDR" -ext-http "$SERVER_ADDR" -db "../../fido-device-onboard-rs/$DB_FILE" -owner-certs -initOnly) 2>&1 || true
+	(cd "$GO_FDO_DIR/examples" && go run ./cmd server -http "$SERVER_ADDR" -ext-http "$SERVER_ADDR" -db "$DB_FILE" -owner-certs -initOnly) 2>&1 || true
 
 	log_step "Step 2: Create delegate chain"
-	(cd "$GO_FDO_DIR/examples" && go run ./cmd delegate -db "../../fido-device-onboard-rs/$DB_FILE" create myDelegate onboard,redirect SECP384R1 ec384 ec384) 2>&1 || return 1
+	(cd "$GO_FDO_DIR/examples" && go run ./cmd delegate -db "$DB_FILE" create myDelegate onboard,redirect SECP384R1 ec384 ec384) 2>&1 || return 1
 	log_success "Delegate chain created"
 
 	log_step "Step 3: Start server with delegate"
@@ -261,7 +261,7 @@ test_delegate() {
 
 	log_step "Step 5: TO1 + TO2 with delegate"
 	DEVICE_CREDENTIAL="$CRED_FILE" \
-	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=/tmp/fdo_onboard_marker_delegate \
+	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=$EPHEMERAL_DIR/fdo_onboard_marker_delegate \
 	ALLOW_NONINTEROPERABLE_KDF=1 \
 	RUST_LOG=info \
 	run_cmd ./target/release/fdo-client-linuxapp || return 1
@@ -278,8 +278,8 @@ test_bmo() {
 	log_section "TEST: BMO Image Transfer"
 	log_info "Tests fdo.bmo FSIM: inline image delivery + BIOS parameters"
 
-	rm -f "$DB_FILE" "$CRED_FILE" /tmp/fdo_onboard_marker_bmo
-	rm -rf /tmp/fdo-bmo
+	rm -f "$DB_FILE" "$CRED_FILE" $EPHEMERAL_DIR/fdo_onboard_marker_bmo
+	rm -rf $EPHEMERAL_DIR/fdo-bmo
 	generate_di_keys
 
 	log_step "Step 1: Create test image file"
@@ -304,22 +304,22 @@ test_bmo() {
 	log_success "DI completed"
 
 	log_step "Step 4: TO1 + TO2 with BMO"
-	BMO_OUTPUT_DIR=/tmp/fdo-bmo \
+	BMO_OUTPUT_DIR=$EPHEMERAL_DIR/fdo-bmo \
 	DEVICE_CREDENTIAL="$CRED_FILE" \
-	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=/tmp/fdo_onboard_marker_bmo \
+	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=$EPHEMERAL_DIR/fdo_onboard_marker_bmo \
 	ALLOW_NONINTEROPERABLE_KDF=1 \
 	RUST_LOG=info \
 	run_cmd ./target/release/fdo-client-linuxapp || return 1
 	log_success "TO1 + TO2 with BMO completed"
 
 	log_step "Step 5: Verify BMO output"
-	if [ -f /tmp/fdo-bmo/test-image.bin ]; then
+	if [ -f $EPHEMERAL_DIR/fdo-bmo/test-image.bin ]; then
 		local orig_size recv_size
 		orig_size=$(stat --format='%s' "$EPHEMERAL_DIR/test-image.bin")
-		recv_size=$(stat --format='%s' /tmp/fdo-bmo/test-image.bin)
+		recv_size=$(stat --format='%s' $EPHEMERAL_DIR/fdo-bmo/test-image.bin)
 		log_success "Image received: $recv_size bytes (original: $orig_size bytes)"
 		if [ "$orig_size" = "$recv_size" ]; then
-			if cmp -s "$EPHEMERAL_DIR/test-image.bin" /tmp/fdo-bmo/test-image.bin; then
+			if cmp -s "$EPHEMERAL_DIR/test-image.bin" $EPHEMERAL_DIR/fdo-bmo/test-image.bin; then
 				log_success "Image content matches original"
 			else
 				log_error "Image content MISMATCH"
@@ -330,14 +330,14 @@ test_bmo() {
 			return 1
 		fi
 	else
-		log_error "BMO image not found at /tmp/fdo-bmo/test-image.bin"
-		ls -la /tmp/fdo-bmo/ 2>/dev/null || true
+		log_error "BMO image not found at $EPHEMERAL_DIR/fdo-bmo/test-image.bin"
+		ls -la $EPHEMERAL_DIR/fdo-bmo/ 2>/dev/null || true
 		return 1
 	fi
 
-	if [ -f /tmp/fdo-bmo/bios_params ]; then
+	if [ -f $EPHEMERAL_DIR/fdo-bmo/bios_params ]; then
 		log_success "BIOS parameters received:"
-		cat /tmp/fdo-bmo/bios_params
+		cat $EPHEMERAL_DIR/fdo-bmo/bios_params
 	else
 		log_info "No BIOS parameters file (may not be sent with -bmo-file mode)"
 	fi
@@ -353,8 +353,8 @@ test_bmo_url() {
 	log_section "TEST: BMO URL Delivery Mode"
 	log_info "Tests fdo.bmo FSIM: URL delivery (device receives URL, does not fetch)"
 
-	rm -f "$DB_FILE" "$CRED_FILE" /tmp/fdo_onboard_marker_bmo_url
-	rm -rf /tmp/fdo-bmo-url
+	rm -f "$DB_FILE" "$CRED_FILE" $EPHEMERAL_DIR/fdo_onboard_marker_bmo_url
+	rm -rf $EPHEMERAL_DIR/fdo-bmo-url
 	generate_di_keys
 
 	log_step "Step 1: Start server with BMO URL mode"
@@ -373,27 +373,27 @@ test_bmo_url() {
 	log_success "DI completed"
 
 	log_step "Step 3: TO1 + TO2 with BMO URL"
-	BMO_OUTPUT_DIR=/tmp/fdo-bmo-url \
+	BMO_OUTPUT_DIR=$EPHEMERAL_DIR/fdo-bmo-url \
 	DEVICE_CREDENTIAL="$CRED_FILE" \
-	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=/tmp/fdo_onboard_marker_bmo_url \
+	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=$EPHEMERAL_DIR/fdo_onboard_marker_bmo_url \
 	ALLOW_NONINTEROPERABLE_KDF=1 \
 	RUST_LOG=info \
 	run_cmd ./target/release/fdo-client-linuxapp || return 1
 	log_success "TO1 + TO2 with BMO URL completed"
 
 	log_step "Step 4: Verify URL info file"
-	if [ -f /tmp/fdo-bmo-url/bmo-url.txt ]; then
+	if [ -f $EPHEMERAL_DIR/fdo-bmo-url/bmo-url.txt ]; then
 		log_success "URL info file received:"
-		cat /tmp/fdo-bmo-url/bmo-url.txt
-		if grep -q "https://example.com/images/rhel9.iso" /tmp/fdo-bmo-url/bmo-url.txt; then
+		cat $EPHEMERAL_DIR/fdo-bmo-url/bmo-url.txt
+		if grep -q "https://example.com/images/rhel9.iso" $EPHEMERAL_DIR/fdo-bmo-url/bmo-url.txt; then
 			log_success "URL content verified"
 		else
 			log_error "URL not found in info file"
 			return 1
 		fi
 	else
-		log_error "URL info file not found at /tmp/fdo-bmo-url/bmo-url.txt"
-		ls -la /tmp/fdo-bmo-url/ 2>/dev/null || true
+		log_error "URL info file not found at $EPHEMERAL_DIR/fdo-bmo-url/bmo-url.txt"
+		ls -la $EPHEMERAL_DIR/fdo-bmo-url/ 2>/dev/null || true
 		return 1
 	fi
 
@@ -408,8 +408,8 @@ test_bmo_set() {
 	log_section "TEST: BMO BIOS Parameter Setting"
 	log_info "Tests fdo.bmo FSIM: BIOS parameter delivery via -bmo flag"
 
-	rm -f "$DB_FILE" "$CRED_FILE" /tmp/fdo_onboard_marker_bmo_set
-	rm -rf /tmp/fdo-bmo-set
+	rm -f "$DB_FILE" "$CRED_FILE" $EPHEMERAL_DIR/fdo_onboard_marker_bmo_set
+	rm -rf $EPHEMERAL_DIR/fdo-bmo-set
 	generate_di_keys
 
 	log_step "Step 1: Create small test image"
@@ -433,20 +433,20 @@ test_bmo_set() {
 	log_success "DI completed"
 
 	log_step "Step 4: TO1 + TO2 with BMO + BIOS params"
-	BMO_OUTPUT_DIR=/tmp/fdo-bmo-set \
+	BMO_OUTPUT_DIR=$EPHEMERAL_DIR/fdo-bmo-set \
 	DEVICE_CREDENTIAL="$CRED_FILE" \
-	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=/tmp/fdo_onboard_marker_bmo_set \
+	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=$EPHEMERAL_DIR/fdo_onboard_marker_bmo_set \
 	ALLOW_NONINTEROPERABLE_KDF=1 \
 	RUST_LOG=info \
 	run_cmd ./target/release/fdo-client-linuxapp || return 1
 	log_success "TO1 + TO2 with BMO + BIOS params completed"
 
 	log_step "Step 5: Verify BIOS parameters"
-	if [ -f /tmp/fdo-bmo-set/bios_params ]; then
+	if [ -f $EPHEMERAL_DIR/fdo-bmo-set/bios_params ]; then
 		log_success "BIOS parameters received:"
-		cat /tmp/fdo-bmo-set/bios_params
-		if grep -q "secure-boot=true" /tmp/fdo-bmo-set/bios_params && \
-		   grep -q "boot-order=pxe,disk,usb" /tmp/fdo-bmo-set/bios_params; then
+		cat $EPHEMERAL_DIR/fdo-bmo-set/bios_params
+		if grep -q "secure-boot=true" $EPHEMERAL_DIR/fdo-bmo-set/bios_params && \
+		   grep -q "boot-order=pxe,disk,usb" $EPHEMERAL_DIR/fdo-bmo-set/bios_params; then
 			log_success "BIOS parameter content verified"
 		else
 			log_error "Expected BIOS parameters not found"
@@ -468,8 +468,8 @@ test_bmo_meta_url() {
 	log_section "TEST: BMO Meta-URL Delivery Mode"
 	log_info "Tests fdo.bmo FSIM: device fetches meta-payload, parses CBOR, resolves image URL"
 
-	rm -f "$DB_FILE" "$CRED_FILE" /tmp/fdo_onboard_marker_bmo_meta
-	rm -rf /tmp/fdo-bmo-meta
+	rm -f "$DB_FILE" "$CRED_FILE" $EPHEMERAL_DIR/fdo_onboard_marker_bmo_meta
+	rm -rf $EPHEMERAL_DIR/fdo-bmo-meta
 	generate_di_keys
 
 	log_step "Step 1: Create test image and meta-payload"
@@ -481,9 +481,9 @@ test_bmo_meta_url() {
 	(cd "$GO_FDO_DIR/examples" && go run ./cmd meta create \
 		-mime "application/x-raw-disk-image" \
 		-url "http://127.0.0.1:18081/actual-image.bin" \
-		-hash-file "../../fido-device-onboard-rs/$EPHEMERAL_DIR/actual-image.bin" \
+		-hash-file "$EPHEMERAL_DIR/actual-image.bin" \
 		-name "test-meta-image" \
-		-out "../../fido-device-onboard-rs/$EPHEMERAL_DIR/meta.cbor") 2>&1 || return 1
+		-out "$EPHEMERAL_DIR/meta.cbor") 2>&1 || return 1
 	log_success "Meta-payload CBOR created"
 
 	log_step "Step 2: Start HTTP server for meta-payload"
@@ -508,37 +508,37 @@ test_bmo_meta_url() {
 	log_success "DI completed"
 
 	log_step "Step 5: TO1 + TO2 with BMO meta-URL"
-	BMO_OUTPUT_DIR=/tmp/fdo-bmo-meta \
+	BMO_OUTPUT_DIR=$EPHEMERAL_DIR/fdo-bmo-meta \
 	DEVICE_CREDENTIAL="$CRED_FILE" \
-	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=/tmp/fdo_onboard_marker_bmo_meta \
+	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=$EPHEMERAL_DIR/fdo_onboard_marker_bmo_meta \
 	ALLOW_NONINTEROPERABLE_KDF=1 \
 	RUST_LOG=info \
 	run_cmd ./target/release/fdo-client-linuxapp || { kill $HTTP_PID 2>/dev/null; return 1; }
 	log_success "TO1 + TO2 with BMO meta-URL completed"
 
 	log_step "Step 6: Verify meta-URL resolution"
-	if [ -f /tmp/fdo-bmo-meta/bmo-meta-url.txt ]; then
+	if [ -f $EPHEMERAL_DIR/fdo-bmo-meta/bmo-meta-url.txt ]; then
 		log_success "Meta-URL info file:"
-		cat /tmp/fdo-bmo-meta/bmo-meta-url.txt
-		if grep -q "image_url=http://127.0.0.1:18081/actual-image.bin" /tmp/fdo-bmo-meta/bmo-meta-url.txt; then
+		cat $EPHEMERAL_DIR/fdo-bmo-meta/bmo-meta-url.txt
+		if grep -q "image_url=http://127.0.0.1:18081/actual-image.bin" $EPHEMERAL_DIR/fdo-bmo-meta/bmo-meta-url.txt; then
 			log_success "Resolved image URL verified"
 		else
 			log_error "Resolved image URL not found in meta info"
 			kill $HTTP_PID 2>/dev/null
 			return 1
 		fi
-		if grep -q "name=test-meta-image" /tmp/fdo-bmo-meta/bmo-meta-url.txt; then
+		if grep -q "name=test-meta-image" $EPHEMERAL_DIR/fdo-bmo-meta/bmo-meta-url.txt; then
 			log_success "Image name from meta-payload verified"
 		fi
 	else
-		log_error "Meta-URL info file not found at /tmp/fdo-bmo-meta/bmo-meta-url.txt"
-		ls -la /tmp/fdo-bmo-meta/ 2>/dev/null || true
+		log_error "Meta-URL info file not found at $EPHEMERAL_DIR/fdo-bmo-meta/bmo-meta-url.txt"
+		ls -la $EPHEMERAL_DIR/fdo-bmo-meta/ 2>/dev/null || true
 		kill $HTTP_PID 2>/dev/null
 		return 1
 	fi
 
-	if [ -f /tmp/fdo-bmo-meta/meta_payload.cbor ]; then
-		log_success "Raw meta-payload CBOR saved ($(stat --format='%s' /tmp/fdo-bmo-meta/meta_payload.cbor) bytes)"
+	if [ -f $EPHEMERAL_DIR/fdo-bmo-meta/meta_payload.cbor ]; then
+		log_success "Raw meta-payload CBOR saved ($(stat --format='%s' $EPHEMERAL_DIR/fdo-bmo-meta/meta_payload.cbor) bytes)"
 	fi
 
 	kill $HTTP_PID 2>/dev/null
@@ -563,7 +563,7 @@ test_tpm_rust_di_go_onboard() {
 
 	# Build Go TPM client
 	log_step "Building Go TPM client"
-	(cd "$GO_FDO_DIR/examples" && go build -tags=tpm -o /tmp/fdo-tpm-client ./cmd) || return 1
+	(cd "$GO_FDO_DIR/examples" && go build -buildvcs=false -tags=tpm -o $EPHEMERAL_DIR/fdo-tpm-client ./cmd) || return 1
 	log_success "Go TPM client built"
 
 	start_go_server "-reuse-cred" || return 1
@@ -581,15 +581,15 @@ test_tpm_rust_di_go_onboard() {
 	log_success "Rust DI completed (credentials in TPM NV)"
 
 	log_step "Step 2: Go tpm-show (verify NV introspection)"
-	/tmp/fdo-tpm-client client -tpm-show || return 1
+	$EPHEMERAL_DIR/fdo-tpm-client client -tpm-show || return 1
 	log_success "Go can read Rust-provisioned TPM NV"
 
 	log_step "Step 3: Go tpm-prove (verify DAK possession with empty authValue)"
-	/tmp/fdo-tpm-client client -tpm-prove || return 1
+	$EPHEMERAL_DIR/fdo-tpm-client client -tpm-prove || return 1
 	log_success "Go can use Rust-created DAK with empty authValue"
 
 	log_step "Step 4: Go onboard (TO1 + TO2)"
-	/tmp/fdo-tpm-client client -fdo-version 200 || return 1
+	$EPHEMERAL_DIR/fdo-tpm-client client -fdo-version 200 || return 1
 	log_success "Go onboard completed"
 
 	stop_server
@@ -613,7 +613,7 @@ test_tpm_go_di_rust_onboard() {
 
 	# Build Go TPM client
 	log_step "Building Go TPM client"
-	(cd "$GO_FDO_DIR/examples" && go build -tags=tpm -o /tmp/fdo-tpm-client ./cmd) || return 1
+	(cd "$GO_FDO_DIR/examples" && go build -buildvcs=false -tags=tpm -o $EPHEMERAL_DIR/fdo-tpm-client ./cmd) || return 1
 	log_success "Go TPM client built"
 
 	start_go_server "-reuse-cred" || return 1
@@ -622,16 +622,16 @@ test_tpm_go_di_rust_onboard() {
 	export TSS2_TCTI="device:/dev/tpmrm0"
 	tpm2_clear -c lockout 2>/dev/null || true
 	export FDO_TPM_OWNER_HIERARCHY=1
-	/tmp/fdo-tpm-client client -tpm-clear 2>/dev/null || true
+	$EPHEMERAL_DIR/fdo-tpm-client client -tpm-clear 2>/dev/null || true
 	log_success "TPM state cleared"
 
 	log_step "Step 2: Go DI with TPM"
-	/tmp/fdo-tpm-client client -di "$SERVER_URL" -di-key ec256 || return 1
+	$EPHEMERAL_DIR/fdo-tpm-client client -di "$SERVER_URL" -di-key ec256 || return 1
 	log_success "Go DI completed (credentials in TPM NV)"
 
 	log_step "Step 3: Rust onboard (TO1 + TO2 from TPM NV)"
 	export LD_LIBRARY_PATH="$(pwd)/target/lib:$LD_LIBRARY_PATH"
-	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=/tmp/fdo_onboard_marker_tpm_cross \
+	DEVICE_ONBOARDING_EXECUTED_MARKER_FILE_PATH=$EPHEMERAL_DIR/fdo_onboard_marker_tpm_cross \
 	ALLOW_NONINTEROPERABLE_KDF=1 \
 	RUST_LOG=info \
 	run_cmd ./target/release/fdo-client-linuxapp || return 1

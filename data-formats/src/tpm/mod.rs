@@ -26,14 +26,13 @@ use crate::errors::Error;
 // NV Index Handles (per spec section 4.2)
 // ============================================================
 
-/// DCActive flag: 1 byte, 0x00 = not initialized, 0x01 = initialized.
-pub const DC_ACTIVE_INDEX: u32 = 0x01D1_0000;
-/// DCTPM: GUID (16 bytes) + DeviceInfo string.
+/// Consolidated DCTPM NV index: single index for all FDO credentials (CBOR array).
 pub const DCTPM_INDEX: u32 = 0x01D1_0001;
-/// DCOV: CBOR-encoded credential metadata (legacy, replaced by consolidated DCTPM).
-pub const DCOV_INDEX: u32 = 0x01D1_0002;
-/// FDO Certificate (legacy, not used).
-pub const FDO_CERT_INDEX: u32 = 0x01D1_0005;
+
+// Legacy NV indices — kept for cleanup_fdo_state to remove old-format data.
+pub(crate) const LEGACY_DC_ACTIVE_INDEX: u32 = 0x01D1_0000;
+pub(crate) const LEGACY_DCOV_INDEX: u32 = 0x01D1_0002;
+pub(crate) const LEGACY_FDO_CERT_INDEX: u32 = 0x01D1_0005;
 
 // ============================================================
 // Persistent Object Handles
@@ -51,12 +50,13 @@ pub const HMAC_KEY_HANDLE: u32 = 0x8102_0003;
 /// NV index attribute profile, determining access controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvProfile {
-    /// Profile A (DCActive): Owner+Auth R/W, NoDA, PlatformCreate.
-    A,
-    /// Profile B (DCTPM, Unique Strings): Auth-only R/W, NoDA, PlatformCreate.
-    B,
-    /// Profile C (DCOV, FDO_Cert): Owner+Auth R/W, NoDA, no PlatformCreate.
-    C,
+    /// DCTPM profile: Owner+Auth R/W, NoDA, optional PlatformCreate.
+    /// Used for the consolidated DCTPM NV index (0x01D10001).
+    Dctpm,
+    /// Legacy Profile B: Owner+Auth R/W, NoDA, PlatformCreate.
+    /// Retained for cleanup of old-format indices.
+    #[allow(dead_code)]
+    LegacyB,
 }
 
 // ============================================================
