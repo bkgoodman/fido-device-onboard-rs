@@ -12,37 +12,56 @@ edition = "2018"
 
 [dependencies]
 ciborium = "0.2.0"
-hex = "0.4"
-openssl = "0.10.72"
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+openssl = { version = "0.10.72", optional = true }
 log = "0.4"
-serde = "1"
-serde_bytes = "0.11"
-serde_cbor = "0.11"
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_bytes = { version = "0.11", default-features = false, features = ["alloc"] }
+serde_cbor = { version = "0.11", optional = true }
 serde_repr = "0.1.19"
 serde_tuple = "0.5"
-thiserror = "1"
-aws-nitro-enclaves-cose = "0.5.2"
-uuid = "1.3"
-num-traits = "0.2"
+thiserror = { version = "1", optional = true }
+aws-nitro-enclaves-cose = { version = "0.5.2", optional = true }
+uuid = { version = "1.3", optional = true }
+num-traits = { version = "0.2", default-features = false }
 num-derive = "0.4"
 paste = "1.0"
-pem = "3.0"
+pem = { version = "3.0", optional = true }
 tss-esapi = { version = "7.6", optional = true }
-byteorder = "1"
+byteorder = { version = "1", default-features = false }
 
-http = "0.2"
+http = { version = "0.2", optional = true }
 
-openssl-kdf = { version = "0.4.2", features = ["allow_custom"] }
+openssl-kdf = { version = "0.4.2", features = ["allow_custom"], optional = true }
+
+# no_std compatible CBOR with serde support
+minicbor-serde = { version = "0.3", features = ["alloc"], optional = true }
 
 [features]
+default = ["std"]
+# Standard library support (default, for linux client)
+std = [
+    "openssl",
+    "serde_cbor",
+    "thiserror",
+    "aws-nitro-enclaves-cose",
+    "uuid",
+    "pem",
+    "http",
+    "openssl-kdf",
+    "ciborium/std",
+    "serde/std",
+]
+# no_std support for UEFI environment
+uefi = ["minicbor-serde"]
 # Whether to use a non-interoperable KDF.
 use_noninteroperable_kdf = []
 # Enable delegate certificate support for FDO 2.0.
 # When disabled, delegate chains in ProveOVHdr20 are ignored (owner key used directly).
-delegate_support = []
+delegate_support = ["std"]
 # Enable TPM support for device credential storage.
 # When disabled, builds without tss-esapi / tpm2-tss-devel dependency.
-tpm_support = ["tss-esapi"]
+tpm_support = ["std", "tss-esapi"]
 # Use generate-bindings for tss-esapi (requires libclang-dev).
 # Only needed when building against a non-standard TSS2 library version.
 tpm_generate_bindings = ["tpm_support", "tss-esapi/generate-bindings"]

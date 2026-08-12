@@ -192,26 +192,93 @@ pub enum TransportProtocol {
     CoAPS = 6,
 }
 
-#[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr)]
-#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RendezvousVariable {
-    DeviceOnly = 0,
-    OwnerOnly = 1,
-    IPAddress = 2,
-    DevicePort = 3,
-    OwnerPort = 4,
-    Dns = 5,
-    ServerCertHash = 6,
-    CaCertHash = 7,
-    UserInput = 8,
-    WifiSsid = 9,
-    WifiPw = 10,
-    Medium = 11,
-    Protocol = 12,
-    Delaysec = 13,
-    Bypass = 14,
-    //Extended = 15,
+    DeviceOnly,
+    OwnerOnly,
+    IPAddress,
+    DevicePort,
+    OwnerPort,
+    Dns,
+    ServerCertHash,
+    CaCertHash,
+    UserInput,
+    WifiSsid,
+    WifiPw,
+    Medium,
+    Protocol,
+    Delaysec,
+    Bypass,
+    //Extended,
+    Unknown(u8),
+}
+
+impl RendezvousVariable {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => RendezvousVariable::DeviceOnly,
+            1 => RendezvousVariable::OwnerOnly,
+            2 => RendezvousVariable::IPAddress,
+            3 => RendezvousVariable::DevicePort,
+            4 => RendezvousVariable::OwnerPort,
+            5 => RendezvousVariable::Dns,
+            6 => RendezvousVariable::ServerCertHash,
+            7 => RendezvousVariable::CaCertHash,
+            8 => RendezvousVariable::UserInput,
+            9 => RendezvousVariable::WifiSsid,
+            10 => RendezvousVariable::WifiPw,
+            11 => RendezvousVariable::Medium,
+            12 => RendezvousVariable::Protocol,
+            13 => RendezvousVariable::Delaysec,
+            14 => RendezvousVariable::Bypass,
+            other => RendezvousVariable::Unknown(other),
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            RendezvousVariable::DeviceOnly => 0,
+            RendezvousVariable::OwnerOnly => 1,
+            RendezvousVariable::IPAddress => 2,
+            RendezvousVariable::DevicePort => 3,
+            RendezvousVariable::OwnerPort => 4,
+            RendezvousVariable::Dns => 5,
+            RendezvousVariable::ServerCertHash => 6,
+            RendezvousVariable::CaCertHash => 7,
+            RendezvousVariable::UserInput => 8,
+            RendezvousVariable::WifiSsid => 9,
+            RendezvousVariable::WifiPw => 10,
+            RendezvousVariable::Medium => 11,
+            RendezvousVariable::Protocol => 12,
+            RendezvousVariable::Delaysec => 13,
+            RendezvousVariable::Bypass => 14,
+            RendezvousVariable::Unknown(v) => v,
+        }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, RendezvousVariable::Unknown(_))
+    }
+}
+
+impl serde::Serialize for RendezvousVariable {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u8(self.to_u8())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RendezvousVariable {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = u8::deserialize(deserializer)?;
+        Ok(RendezvousVariable::from_u8(v))
+    }
 }
 
 impl RendezvousVariable {
@@ -232,6 +299,7 @@ impl RendezvousVariable {
             RendezvousVariable::Protocol => "protocol",
             RendezvousVariable::Delaysec => "delay-sec",
             RendezvousVariable::Bypass => "bypass",
+            RendezvousVariable::Unknown(_) => "unknown",
         }
     }
 
@@ -285,6 +353,9 @@ impl RendezvousVariable {
             }
             RendezvousVariable::CaCertHash => return Err(Error::NotImplemented("CaCertHash")),
             RendezvousVariable::Medium => return Err(Error::NotImplemented("Medium")),
+            RendezvousVariable::Unknown(_) => {
+                return Err(Error::NotImplemented("unknown RVVariable"))
+            }
         })
     }
 }

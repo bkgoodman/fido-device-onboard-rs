@@ -94,6 +94,10 @@ impl RendezvousInterpretedDirective {
 
         for instruction in info {
             let variable = instruction.variable();
+            // Skip unknown RVVariable tags per FDO spec (silently ignore)
+            if variable.is_unknown() {
+                continue;
+            }
             // Flag-only instructions (like Bypass, OwnerOnly, DeviceOnly) have no value
             let value_bytes = instruction.value();
             // For instructions with values, deserialize; for flags, use a dummy
@@ -175,6 +179,12 @@ impl RendezvousInterpretedDirective {
                         // No bypass possible on owner server
                         return Ok(None);
                     }
+                }
+                RendezvousVariable::Unknown(_) => {
+                    // Per FDO spec: unknown RVVariable tags are silently ignored.
+                    // "On constrained devices, some variables do not exist.
+                    //  The constrained implementation interprets each instruction
+                    //  as if this variable was not present."
                 }
             }
         }
