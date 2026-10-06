@@ -43,6 +43,11 @@ pub fn aad_prove_ov_hdr() -> Vec<u8> {
     encode_domain_aad("FDO-TO2-ProveOVHdr-v1")
 }
 
+/// TO2.SetupDevice20
+pub fn aad_setup_device() -> Vec<u8> {
+    encode_domain_aad("FDO-TO2-SetupDevice-v1")
+}
+
 /// Ownership Voucher entry
 pub fn aad_ov_entry() -> Vec<u8> {
     encode_domain_aad("FDO-OVEntry-v1")

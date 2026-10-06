@@ -3,8 +3,9 @@
 
 // FDO 2.0 Transfer Ownership 1 (TO1) Protocol Messages
 //
-// TO1 uses the SAME message types as FDO 1.1 (30-33) but adds
-// CapabilityFlags as a trailing field to HelloRV and HelloRVAck.
+// TO1 uses the SAME message types as FDO 1.1 (30-33). In 2.0, HelloRV and
+// HelloRVAck lead with CapabilityFlags and VendorCapFlags and no longer carry
+// eASigInfo / eBSigInfo.
 // ProveToRV and RVRedirect are unchanged (COSE_Sign1 wrappers).
 
 use serde::Deserialize;
@@ -14,28 +15,26 @@ use crate::simple_message_serializable;
 use crate::{
     constants::MessageType,
     messages::{ClientMessage, EncryptionRequirement, Message, ServerMessage},
-    types::{COSESign, CapabilityFlags, Guid, Nonce, SigInfo},
+    types::{COSESign, CapabilityFlags, Guid, Nonce},
 };
 
 // Type 30: TO1.HelloRV - FDO 2.0
-// Device initiates TO1. CapabilityFlags fields are FLATTENED
-// (Go embeds CapabilityFlags, so Flags/VendorUnique are top-level fields).
+// Spec: [CapabilityFlags, VendorCapFlags, Guid]
 #[derive(Debug, Serialize_tuple, Deserialize)]
 pub struct HelloRV {
-    guid: Guid,
-    a_signature_info: SigInfo,
     #[serde(with = "serde_bytes")]
     capability_flags: Vec<u8>,
-    // VendorUnique omitted (skip_serializing_if not supported in Serialize_tuple
-    // with trailing Option; Go's omitempty also omits it when nil)
+    vendor_cap_flags: Vec<String>,
+    guid: Guid,
 }
 
 impl HelloRV {
-    pub fn new(guid: Guid, a_signature_info: SigInfo, capability_flags: CapabilityFlags) -> Self {
+    pub fn new(guid: Guid, capability_flags: CapabilityFlags) -> Self {
+        let (capability_flags, vendor_cap_flags) = capability_flags.into_parts();
         HelloRV {
+            capability_flags,
+            vendor_cap_flags,
             guid,
-            a_signature_info,
-            capability_flags: capability_flags.flags,
         }
     }
 
@@ -43,8 +42,8 @@ impl HelloRV {
         &self.guid
     }
 
-    pub fn a_signature_info(&self) -> &SigInfo {
-        &self.a_signature_info
+    pub fn capability_flags(&self) -> CapabilityFlags {
+        CapabilityFlags::from_parts(&self.capability_flags, &self.vendor_cap_flags)
     }
 }
 
@@ -69,55 +68,13 @@ impl Message for HelloRV {
 impl ClientMessage for HelloRV {}
 
 // Type 31: TO1.HelloRVAck - FDO 2.0
-// Server acknowledges HelloRV. CapabilityFlags fields are FLATTENED.
-// Array: [Nonce, SigInfo, Flags_bytes, VendorUnique_optional]
-#[derive(Debug, Serialize_tuple)]
+// Spec: [CapabilityFlags, VendorCapFlags, NonceTO1Proof]
+#[derive(Debug, Serialize_tuple, Deserialize)]
 pub struct HelloRVAck {
-    nonce4: Nonce,
-    b_signature_info: SigInfo,
     #[serde(with = "serde_bytes")]
     capability_flags: Vec<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    vendor_unique: Option<Vec<String>>,
-}
-
-impl<'de> serde::Deserialize<'de> for HelloRVAck {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = HelloRVAck;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a CBOR array of 3 or 4 elements for HelloRVAck")
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<HelloRVAck, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                let nonce4 = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                let b_signature_info = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
-                let flags: serde_bytes::ByteBuf = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
-                let vendor_unique: Option<Vec<String>> = seq.next_element()?;
-                Ok(HelloRVAck {
-                    nonce4,
-                    b_signature_info,
-                    capability_flags: flags.into_vec(),
-                    vendor_unique,
-                })
-            }
-        }
-        deserializer.deserialize_seq(Visitor)
-    }
+    vendor_cap_flags: Vec<String>,
+    nonce4: Nonce,
 }
 
 impl HelloRVAck {
@@ -125,8 +82,8 @@ impl HelloRVAck {
         &self.nonce4
     }
 
-    pub fn b_signature_info(&self) -> &SigInfo {
-        &self.b_signature_info
+    pub fn capability_flags(&self) -> CapabilityFlags {
+        CapabilityFlags::from_parts(&self.capability_flags, &self.vendor_cap_flags)
     }
 }
 
@@ -190,21 +147,72 @@ impl Message for ProveToRV {
 impl ClientMessage for ProveToRV {}
 
 #[derive(Debug)]
-pub struct RVRedirect(COSESign);
+pub struct RVRedirect {
+    num_to1ds: u64,
+    idx_to1ds: u64,
+    to1ds: Vec<COSESign>,
+}
 
-simple_message_serializable!(RVRedirect, COSESign);
+// FDO 2.0 wire form: [numTo1ds, idxTo1ds, [to1d, ...]]
+impl crate::Serializable for RVRedirect {
+    fn deserialize_from_reader<R>(reader: R) -> Result<Self, crate::Error>
+    where
+        R: std::io::Read,
+    {
+        use crate::cborparser::{ParsedArray, ParsedArraySize3, ParsedArraySizeDynamic};
+        let arr: ParsedArray<ParsedArraySize3> = ParsedArray::deserialize_from_reader(reader)?;
+        let list: ParsedArray<ParsedArraySizeDynamic> =
+            ParsedArray::deserialize_data(arr.get_raw(2))?;
+        let mut to1ds = Vec::with_capacity(list.len());
+        for i in 0..list.len() {
+            to1ds.push(COSESign::deserialize_data(list.get_raw(i))?);
+        }
+        Ok(RVRedirect {
+            num_to1ds: arr.get(0)?,
+            idx_to1ds: arr.get(1)?,
+            to1ds,
+        })
+    }
+
+    fn serialize_to_writer<W>(&self, mut writer: W) -> Result<(), crate::Error>
+    where
+        W: std::io::Write,
+    {
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(&(self.num_to1ds, self.idx_to1ds), &mut out)?;
+        out[0] = 0x83; // extend the 2-element header to 3; the list follows
+        let len = self.to1ds.len();
+        if len < 24 {
+            out.push(0x80 | len as u8);
+        } else {
+            return Err(crate::Error::InconsistentValue("too many to1d blobs"));
+        }
+        for to1d in &self.to1ds {
+            out.extend(to1d.serialize_data()?);
+        }
+        writer.write_all(&out)?;
+        Ok(())
+    }
+}
 
 impl RVRedirect {
+    /// A redirect carrying a single rendezvous blob (no Delegation).
     pub fn new(to1d: COSESign) -> Self {
-        RVRedirect(to1d)
+        RVRedirect {
+            num_to1ds: 1,
+            idx_to1ds: 0,
+            to1ds: vec![to1d],
+        }
     }
 
-    pub fn to1d(&self) -> &COSESign {
-        &self.0
-    }
-
-    pub fn into_to1d(self) -> COSESign {
-        self.0
+    /// Return the first rendezvous blob. Fetching further blobs with
+    /// TO1.RVMore (Delegation only) is not supported.
+    pub fn into_to1d(mut self) -> Result<COSESign, crate::Error> {
+        if self.idx_to1ds != 0 || self.to1ds.is_empty() || self.num_to1ds < self.to1ds.len() as u64
+        {
+            return Err(crate::Error::InconsistentValue("malformed TO1.RVRedirect"));
+        }
+        Ok(self.to1ds.swap_remove(0))
     }
 }
 
@@ -227,3 +235,110 @@ impl Message for RVRedirect {
 }
 
 impl ServerMessage for RVRedirect {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{messages::v20::to2::HelloDeviceProbe, Serializable};
+
+    // FDO 2.0 messages carrying capability flags must lead with
+    // CapabilityFlags (bstr) and VendorCapFlags ([* tstr]) as separate elements.
+    fn assert_caps_layout(serialized: &[u8], expected_len: usize) {
+        let elems: Vec<ciborium::Value> = ciborium::de::from_reader(serialized).unwrap();
+        assert_eq!(elems.len(), expected_len);
+        assert!(
+            elems[0].is_bytes(),
+            "element 0 must be CapabilityFlags bstr"
+        );
+        assert!(
+            elems[1].is_array(),
+            "element 1 must be VendorCapFlags array"
+        );
+    }
+
+    #[test]
+    fn test_hello_rv_spec_layout() {
+        let msg = HelloRV::new(Guid::new().unwrap(), CapabilityFlags::new_v20_client());
+        let b = msg.serialize_data().unwrap();
+        assert_caps_layout(&b, 3);
+        let rt = HelloRV::deserialize_data(&b).unwrap();
+        assert_eq!(rt.guid(), msg.guid());
+    }
+
+    #[test]
+    fn test_hello_device_probe_spec_layout() {
+        let msg = HelloDeviceProbe::new(
+            Guid::new().unwrap(),
+            CapabilityFlags::new_v20_client(),
+            vec![-16],
+            vec![0u8; 16],
+        );
+        assert_caps_layout(&msg.serialize_data().unwrap(), 6);
+    }
+
+    #[test]
+    fn test_rv_redirect_malformed_rejected() {
+        // [numTo1ds=1, idxTo1ds=0, []]: no blob
+        let empty = RVRedirect::deserialize_data(&[0x83, 0x01, 0x00, 0x80]).unwrap();
+        assert!(empty.into_to1d().is_err());
+        // idxTo1ds != 0 (RVMore continuation) is not supported
+        let cont = RVRedirect::deserialize_data(&[0x83, 0x02, 0x01, 0x80]).unwrap();
+        assert!(cont.into_to1d().is_err());
+    }
+
+    #[test]
+    fn test_to1d_payload_v11_and_v20() {
+        use crate::constants::HashType;
+        use crate::types::{Hash, TO1DataPayload};
+        let hash = Hash::from_data(HashType::Sha256, b"to0d").unwrap();
+        let v11 = serde_cbor::to_vec(&TO1DataPayload::new(vec![], hash.clone())).unwrap();
+        assert_eq!(v11[0], 0x82);
+        let p: TO1DataPayload = serde_cbor::from_slice(&v11).unwrap();
+        assert!(p.delegate_chain().unwrap().is_none());
+
+        // FDO 2.0: third element is bstr .cbor CertChainOrNull
+        let mut v20 = v11.clone();
+        v20[0] = 0x83;
+        v20.extend_from_slice(&[0x41, 0xf6]); // bstr(null)
+        let p: TO1DataPayload = serde_cbor::from_slice(&v20).unwrap();
+        assert!(p.delegate_chain().unwrap().is_none());
+
+        let mut v20d = v11;
+        v20d[0] = 0x83;
+        v20d.extend_from_slice(&[0x44, 0x81, 0x42, 0x30, 0x01]); // bstr([h'3001'])
+        let p: TO1DataPayload = serde_cbor::from_slice(&v20d).unwrap();
+        assert_eq!(
+            p.delegate_chain().unwrap().unwrap()[0].as_ref(),
+            &[0x30, 0x01]
+        );
+    }
+
+    #[test]
+    fn test_to2_errata1_layouts() {
+        use crate::messages::v20::to2::{DeviceSvcInfo20, DeviceSvcInfoRdy20, Done20};
+        use crate::types::ServiceInfo;
+        let nonce = Nonce::new().unwrap();
+
+        // 86: [null, maxOwnerServiceInfoSz, NonceTO2SetupDV_Prep]
+        let b = DeviceSvcInfoRdy20::new(Some(1300), nonce.clone())
+            .serialize_data()
+            .unwrap();
+        let v: Vec<serde_cbor::Value> = serde_cbor::from_slice(&b).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0], serde_cbor::Value::Null);
+
+        // 88: [null, IsMore, ServiceInfo]
+        let b = DeviceSvcInfo20::new(false, ServiceInfo::new())
+            .serialize_data()
+            .unwrap();
+        let v: Vec<serde_cbor::Value> = serde_cbor::from_slice(&b).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0], serde_cbor::Value::Null);
+
+        // 90: [NonceTO2ProveDv, ReplacementHMac]
+        let b = Done20::new(nonce.clone(), None).serialize_data().unwrap();
+        let v: Vec<serde_cbor::Value> = serde_cbor::from_slice(&b).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0], serde_cbor::Value::Bytes(nonce.value().to_vec()));
+    }
+}

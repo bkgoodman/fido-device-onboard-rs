@@ -308,7 +308,7 @@ impl OwnershipVoucher {
             &new_entry,
             None,
             owner_private_key,
-            &crate::cose_aad::aad_ov_entry(),
+            &ov_entry_aad(self.header()),
         )?;
         let signed_new_entry = OwnershipVoucherEntry::new(signed_new_entry);
 
@@ -331,6 +331,16 @@ impl OwnershipVoucher {
         self.contents
             .get(OwnershipVoucherIndex::Header as usize)
             .unwrap()
+    }
+}
+
+/// External AAD for OVEntry signatures. Domain separation applies only to
+/// vouchers created at FDO 2.0+; FDO 1.x vouchers use empty external_aad.
+fn ov_entry_aad(header: &OwnershipVoucherHeader) -> Vec<u8> {
+    if header.protocol_version() >= ProtocolVersion::Version2_0 {
+        crate::cose_aad::aad_ov_entry()
+    } else {
+        Vec::new()
     }
 }
 
@@ -392,8 +402,10 @@ impl EntryIter<'_> {
         entry: OwnershipVoucherEntry,
     ) -> Result<OwnershipVoucherEntryPayload> {
         let entry_cose = entry.0;
-        let entry: OwnershipVoucherEntryPayload = entry_cose
-            .get_payload_with_aad(self.last_pubkey.pkey(), &crate::cose_aad::aad_ov_entry())?;
+        let entry: OwnershipVoucherEntryPayload = entry_cose.get_payload_with_aad(
+            self.last_pubkey.pkey(),
+            &ov_entry_aad(self.voucher.header()),
+        )?;
 
         // Compare the HashPreviousEntry to either (HeaderTag || HeaderHmac) or the previous entry
         let hash_previous_entry = if self.index == 0 {

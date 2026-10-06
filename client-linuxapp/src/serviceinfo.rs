@@ -2,7 +2,7 @@
 // Copyright (c) 2026, Dell Technologies, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
 use std::{env, fs};
@@ -41,6 +41,50 @@ fn find_available_modules() -> Result<Vec<ServiceInfoModule>> {
 const BMO_DELIVERY_MODE_INLINE: u64 = 0;
 const BMO_DELIVERY_MODE_URL: u64 = 1;
 const BMO_DELIVERY_MODE_META_URL: u64 = 2;
+
+// (generic key, legacy fdo.bmo alias) for the begin delivery fields
+// (chunking-strategy.md "Begin Message Fields").
+const BEGIN_DELIVERY_KEY_ALIASES: [(i128, i128); 5] =
+    [(5, -6), (6, -7), (7, -8), (8, -9), (9, -10)];
+
+// fdo.bmo error code: provisioning not authorized.
+const BMO_ERROR_PROVISION_NOT_AUTHORIZED: i128 = 15;
+
+/// A signed provisioning message is a COSE_Sign1:
+/// [protected bstr, unprotected map, payload bstr, signature bstr].
+fn is_cose_sign1(value: &serde_cbor::Value) -> bool {
+    matches!(value, serde_cbor::Value::Array(a) if a.len() == 4
+        && matches!(a[0], serde_cbor::Value::Bytes(_))
+        && matches!(a[1], serde_cbor::Value::Map(_))
+        && matches!(a[3], serde_cbor::Value::Bytes(_)))
+}
+
+fn send_bmo_error(
+    si_out: &mut ServiceInfo,
+    code: i128,
+    message: &str,
+    details: &str,
+) -> Result<()> {
+    let mut err = std::collections::BTreeMap::new();
+    err.insert(
+        serde_cbor::Value::Integer(0),
+        serde_cbor::Value::Integer(code),
+    );
+    err.insert(
+        serde_cbor::Value::Integer(1),
+        serde_cbor::Value::Text(message.to_string()),
+    );
+    err.insert(
+        serde_cbor::Value::Integer(2),
+        serde_cbor::Value::Text(details.to_string()),
+    );
+    si_out.add(
+        FdoServiceInfoModule::Bmo,
+        "error",
+        &serde_cbor::Value::Map(err),
+    )?;
+    Ok(())
+}
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -115,20 +159,42 @@ impl BmoInProgress {
         let image_type = get_text(-1)
             .ok_or_else(|| anyhow!("BMO image-begin: missing required field -1 (image_type)"))?;
 
+        // Delivery fields use the generic chunking keys 5-9. The former
+        // fdo.bmo keys -6..-10 are accepted as aliases; a message setting a
+        // key and its alias to different values is rejected.
+        for (generic, alias) in BEGIN_DELIVERY_KEY_ALIASES {
+            if let (Some(g), Some(a)) = (get_int(generic), get_int(alias)) {
+                if g != a {
+                    bail!(
+                        "BMO image-begin: key {} and its legacy alias {} differ",
+                        generic,
+                        alias
+                    );
+                }
+            }
+        }
+        let pick = |generic: i128, alias: i128| {
+            if get_int(generic).is_some() {
+                generic
+            } else {
+                alias
+            }
+        };
+
         Ok(BmoImageBegin {
             image_type,
             total_size: get_u64(0),
             hash_alg: get_text(1),
             require_ack: get_bool(3).unwrap_or(false),
-            delivery_mode: get_u64(-6).unwrap_or(BMO_DELIVERY_MODE_INLINE),
+            delivery_mode: get_u64(pick(5, -6)).unwrap_or(BMO_DELIVERY_MODE_INLINE),
             name: get_text(-3),
             version: get_text(-4),
             description: get_text(-5),
             boot_args: get_text(-2),
-            url: get_text(-7),
-            tls_ca: get_bytes(-8),
-            expected_hash: get_bytes(-9),
-            meta_signer: get_bytes(-10),
+            url: get_text(pick(6, -7)),
+            tls_ca: get_bytes(pick(7, -8)),
+            expected_hash: get_bytes(pick(8, -9)),
+            meta_signer: get_bytes(pick(9, -10)),
         })
     }
 
@@ -173,7 +239,30 @@ impl BmoInProgress {
 
         match begin.delivery_mode {
             BMO_DELIVERY_MODE_INLINE => {
-                // Verify hash if provided
+                // Every hash present must match: image-begin's expected_hash
+                // (key 8) and image-end's hash.
+                if let Some(expected) = &begin.expected_hash {
+                    let alg = begin.hash_alg.as_deref().unwrap_or("sha256");
+                    let hash_type = match alg {
+                        "sha256" => HashType::Sha256,
+                        "sha384" => HashType::Sha384,
+                        _ => {
+                            Self::send_result(
+                                si_out,
+                                2,
+                                &format!("Unsupported hash algorithm: {}", alg),
+                            )?;
+                            return Ok(());
+                        }
+                    };
+                    let hash = Hash::from_digest(hash_type, expected.clone())?;
+                    if hash.compare_data(&self.data).is_err() {
+                        log::error!("BMO image does not match image-begin expected_hash");
+                        Self::send_result(si_out, 2, "Hash verification failed")?;
+                        return Ok(());
+                    }
+                    log::info!("BMO image matches image-begin expected_hash ({})", alg);
+                }
                 if let Some(expected_hash) = hash_bytes {
                     let alg = hash_alg.as_deref().unwrap_or("sha256");
                     let hash_type = match alg {
@@ -366,56 +455,96 @@ impl BmoInProgress {
     }
 }
 
-fn bmo_handle_set(value: &serde_cbor::Value, si_out: &mut ServiceInfo) -> Result<()> {
-    let params = match value {
-        serde_cbor::Value::Array(a) => a,
-        _ => bail!("BMO set: expected CBOR array, got {:?}", value),
+/// Handle fdo.bmo:set. A set is atomic (fdo.bmo.md "Atomicity"): every
+/// parameter is validated before any is applied, all are applied or none
+/// is, and exactly one response describes the outcome. Responses are queued
+/// and sent one per ServiceInfo round.
+fn bmo_handle_set(
+    value: &serde_cbor::Value,
+    responses: &mut VecDeque<serde_cbor::Value>,
+) -> Result<()> {
+    let respond = |responses: &mut VecDeque<serde_cbor::Value>, status: i128, msg: String| {
+        responses.push_back(serde_cbor::Value::Array(vec![
+            serde_cbor::Value::Integer(status),
+            serde_cbor::Value::Text(msg),
+        ]));
     };
 
-    let output_dir = env::var("BMO_OUTPUT_DIR").unwrap_or_else(|_| "/tmp/fdo-bmo".to_string());
-    let params_path = PathBuf::from(&output_dir).join("bios_params");
-    fs::create_dir_all(&output_dir).context("BMO: failed to create output directory")?;
+    let params = match value {
+        serde_cbor::Value::Array(a) if !a.is_empty() => a,
+        _ => {
+            respond(
+                responses,
+                2,
+                "Invalid set message; no parameters applied".into(),
+            );
+            return Ok(());
+        }
+    };
 
-    let mut param_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&params_path)
-        .with_context(|| format!("BMO: failed to open {:?}", params_path))?;
-
+    // Validate every parameter before applying any
+    let mut lines = String::new();
     for param in params {
-        let pair = match param {
-            serde_cbor::Value::Array(p) if p.len() >= 2 => p,
+        let (name, value) = match param {
+            serde_cbor::Value::Array(p) if p.len() == 2 => (&p[0], &p[1]),
             _ => {
-                log::warn!("BMO set: skipping malformed parameter: {:?}", param);
-                continue;
+                respond(
+                    responses,
+                    2,
+                    "Invalid parameter format, expected [name, value]; no parameters applied"
+                        .into(),
+                );
+                return Ok(());
             }
         };
-        let name = match &pair[0] {
-            serde_cbor::Value::Text(s) => s.clone(),
+        let name = match name {
+            serde_cbor::Value::Text(s) => s,
             _ => {
-                log::warn!("BMO set: non-string parameter name: {:?}", pair[0]);
-                continue;
+                respond(
+                    responses,
+                    2,
+                    "Non-string parameter name; no parameters applied".into(),
+                );
+                return Ok(());
             }
         };
-        let value_str = match &pair[1] {
+        let value_str = match value {
             serde_cbor::Value::Text(s) => s.clone(),
             serde_cbor::Value::Bool(b) => b.to_string(),
             serde_cbor::Value::Integer(i) => i.to_string(),
-            serde_cbor::Value::Null => "null".to_string(),
-            other => format!("{:?}", other),
+            _ => {
+                respond(
+                    responses,
+                    2,
+                    format!("Unsupported value type for {name}; no parameters applied"),
+                );
+                return Ok(());
+            }
         };
-
-        writeln!(param_file, "{}={}", name, value_str)
-            .with_context(|| format!("BMO: failed to write parameter {}={}", name, value_str))?;
         log::info!("BMO BIOS parameter: {}={}", name, value_str);
-
-        let response: Vec<serde_cbor::Value> = vec![
-            serde_cbor::Value::Integer(0),
-            serde_cbor::Value::Text(format!("Set {}={}", name, value_str)),
-        ];
-        si_out.add(FdoServiceInfoModule::Bmo, "response", &response)?;
+        lines.push_str(&format!("{name}={value_str}\n"));
     }
 
+    // Apply all at once: one write of the whole set
+    let output_dir = env::var("BMO_OUTPUT_DIR").unwrap_or_else(|_| "/tmp/fdo-bmo".to_string());
+    fs::create_dir_all(&output_dir).context("BMO: failed to create output directory")?;
+    let params_path = PathBuf::from(&output_dir).join("bios_params");
+    let applied = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&params_path)
+        .and_then(|mut f| f.write_all(lines.as_bytes()));
+    match applied {
+        Ok(()) => respond(
+            responses,
+            0,
+            format!("Applied {} parameter(s)", params.len()),
+        ),
+        Err(e) => {
+            log::error!("BMO: failed to write {:?}: {}", params_path, e);
+            respond(responses, 2, "Failed to apply parameters".into());
+        }
+    }
     Ok(())
 }
 
@@ -423,6 +552,7 @@ async fn process_serviceinfo_in(
     si_in: &ServiceInfo,
     si_out: &mut ServiceInfo,
     bmo_in_progress: &mut BmoInProgress,
+    bios_responses: &mut VecDeque<serde_cbor::Value>,
     active_modules: &mut HashSet<ServiceInfoModule>,
 ) -> Result<bool> {
     for (module, key, value) in si_in.iter() {
@@ -444,7 +574,20 @@ async fn process_serviceinfo_in(
         }
 
         if module == FdoServiceInfoModule::Bmo.into() {
-            if key == "image-begin" {
+            if (key == "image-begin" || key == "set") && is_cose_sign1(&value) {
+                // Signed provisioning (artifact authority) is not implemented
+                // by this client: refuse it rather than ignore the signature.
+                log::warn!(
+                    "BMO {}: signed provisioning message not supported, refusing",
+                    key
+                );
+                send_bmo_error(
+                    si_out,
+                    BMO_ERROR_PROVISION_NOT_AUTHORIZED,
+                    "Provisioning not authorized",
+                    "signed provisioning messages are not supported by this client",
+                )?;
+            } else if key == "image-begin" {
                 let begin = BmoInProgress::parse_image_begin(&value)
                     .context("Error parsing BMO image-begin")?;
                 log::info!(
@@ -491,7 +634,7 @@ async fn process_serviceinfo_in(
                     .context("Error finalizing BMO image")?;
                 *bmo_in_progress = BmoInProgress::new();
             } else if key == "set" {
-                bmo_handle_set(&value, si_out).context("Error handling BMO set")?;
+                bmo_handle_set(&value, bios_responses).context("Error handling BMO set")?;
             }
         } else {
             log::debug!("Ignoring unknown module {} key {}", module, key);
@@ -506,6 +649,7 @@ pub(crate) async fn perform_to2_serviceinfos(client: &mut ServiceClient) -> Resu
     let mut out_si = ServiceInfo::new();
     let mut reboot_required = false;
     let mut bmo_state = BmoInProgress::new();
+    let mut bios_responses: VecDeque<serde_cbor::Value> = VecDeque::new();
     let mut active_modules: HashSet<ServiceInfoModule> = HashSet::new();
 
     while loop_num < MAX_SERVICE_INFO_LOOPS {
@@ -540,6 +684,11 @@ pub(crate) async fn perform_to2_serviceinfos(client: &mut ServiceClient) -> Resu
             out_si.add_modules(&modules)?;
         }
 
+        // At most one BIOS response per round (see bmo_handle_set)
+        if let Some(response) = bios_responses.pop_front() {
+            out_si.add(FdoServiceInfoModule::Bmo, "response", &response)?;
+        }
+
         let send_si = DeviceSvcInfo20::new(false, out_si);
         out_si = ServiceInfo::new();
         log::trace!("Sending ServiceInfo loop {}: {:?}", loop_num, send_si);
@@ -558,6 +707,7 @@ pub(crate) async fn perform_to2_serviceinfos(client: &mut ServiceClient) -> Resu
             return_si.service_info(),
             &mut out_si,
             &mut bmo_state,
+            &mut bios_responses,
             &mut active_modules,
         )
         .await
@@ -576,4 +726,87 @@ pub(crate) async fn perform_to2_serviceinfos(client: &mut ServiceClient) -> Resu
         "Maximum number of ServiceInfo loops ({}) exceeded",
         MAX_SERVICE_INFO_LOOPS
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_cbor::Value;
+    use std::collections::BTreeMap;
+
+    fn begin(entries: &[(i128, Value)]) -> Value {
+        let mut m = BTreeMap::new();
+        m.insert(Value::Integer(-1), Value::Text("application/efi".into()));
+        for (k, v) in entries {
+            m.insert(Value::Integer(*k), v.clone());
+        }
+        Value::Map(m)
+    }
+
+    #[test]
+    fn test_image_begin_generic_delivery_keys() {
+        let b = BmoInProgress::parse_image_begin(&begin(&[
+            (5, Value::Integer(1)),
+            (6, Value::Text("https://x/i".into())),
+            (8, Value::Bytes(vec![1, 2])),
+        ]))
+        .unwrap();
+        assert_eq!(b.delivery_mode, BMO_DELIVERY_MODE_URL);
+        assert_eq!(b.url.as_deref(), Some("https://x/i"));
+        assert_eq!(b.expected_hash, Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn test_image_begin_legacy_alias_and_conflict() {
+        let b = BmoInProgress::parse_image_begin(&begin(&[(-6, Value::Integer(2))])).unwrap();
+        assert_eq!(b.delivery_mode, BMO_DELIVERY_MODE_META_URL);
+        assert!(BmoInProgress::parse_image_begin(&begin(&[
+            (5, Value::Integer(1)),
+            (-6, Value::Integer(2)),
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn test_signed_provisioning_detected() {
+        let cose = Value::Array(vec![
+            Value::Bytes(vec![0xa0]),
+            Value::Map(BTreeMap::new()),
+            Value::Bytes(vec![]),
+            Value::Bytes(vec![0; 64]),
+        ]);
+        assert!(is_cose_sign1(&cose));
+        assert!(!is_cose_sign1(&begin(&[])));
+    }
+
+    #[test]
+    fn test_bios_set_is_atomic_with_one_response() {
+        let dir = std::env::temp_dir().join(format!("fdo-bmo-test-{}", std::process::id()));
+        std::env::set_var("BMO_OUTPUT_DIR", &dir);
+        let set = Value::Array(vec![
+            Value::Array(vec![Value::Text("a".into()), Value::Text("1".into())]),
+            Value::Array(vec![Value::Text("b".into()), Value::Text("2".into())]),
+        ]);
+        let mut q = VecDeque::new();
+        bmo_handle_set(&set, &mut q).unwrap();
+        assert_eq!(q.len(), 1, "one response per atomic set");
+        assert_eq!(
+            fs::read_to_string(dir.join("bios_params")).unwrap(),
+            "a=1\nb=2\n"
+        );
+
+        // A malformed parameter rejects the whole set: nothing applied
+        let bad = Value::Array(vec![
+            Value::Array(vec![Value::Text("c".into()), Value::Text("3".into())]),
+            Value::Array(vec![Value::Text("d".into())]),
+        ]);
+        let mut q = VecDeque::new();
+        bmo_handle_set(&bad, &mut q).unwrap();
+        assert_eq!(q.len(), 1);
+        assert!(matches!(&q[0], Value::Array(r) if r[0] == Value::Integer(2)));
+        assert!(!fs::read_to_string(dir.join("bios_params"))
+            .unwrap()
+            .contains("c=3"));
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

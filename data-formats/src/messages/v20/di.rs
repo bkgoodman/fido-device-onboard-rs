@@ -16,13 +16,15 @@ use crate::{
 };
 
 // Type 10: DI.AppStart - FDO 2.0
-// Device initiates Device Initialization with capability flags.
+// Spec: [CapabilityFlags, VendorCapFlags, DeviceMfgInfo]
 // The info field is a Bstr-wrapped DeviceMfgInfo (CBOR array serialized
 // into a byte string), matching Go's cbor.Bstr[T] convention.
 #[derive(Debug, Serialize_tuple, Deserialize)]
 pub struct AppStart {
+    #[serde(with = "serde_bytes")]
+    capability_flags: Vec<u8>,
+    vendor_cap_flags: Vec<String>,
     info: Option<ByteBuf>,
-    capability_flags: CapabilityFlags,
 }
 
 impl AppStart {
@@ -32,14 +34,16 @@ impl AppStart {
     pub fn new(info: &DeviceMfgInfo, capability_flags: CapabilityFlags) -> Self {
         let mut buffer = Vec::new();
         ciborium::ser::into_writer(info, &mut buffer).expect("Failed to serialize DeviceMfgInfo");
+        let (capability_flags, vendor_cap_flags) = capability_flags.into_parts();
         AppStart {
-            info: Some(ByteBuf::from(buffer)),
             capability_flags,
+            vendor_cap_flags,
+            info: Some(ByteBuf::from(buffer)),
         }
     }
 
-    pub fn capability_flags(&self) -> &CapabilityFlags {
-        &self.capability_flags
+    pub fn capability_flags(&self) -> CapabilityFlags {
+        CapabilityFlags::from_parts(&self.capability_flags, &self.vendor_cap_flags)
     }
 }
 
@@ -76,9 +80,18 @@ impl crate::Serializable for SetCredentials {
     where
         W: std::io::Write,
     {
+        // FDO 2.0: [CapabilityFlags, VendorCapFlags, bstr .cbor OVHeader]
         let ov_header_bytes = self.ov_header.serialize_data()?;
+        let caps = crate::types::CapabilityFlags::new_v20_client();
         let mut buffer = Vec::new();
-        ciborium::ser::into_writer(&(&ov_header_bytes[..],), buffer.by_ref())?;
+        ciborium::ser::into_writer(
+            &(
+                serde_bytes::Bytes::new(&caps.flags),
+                Vec::<String>::new(),
+                serde_bytes::Bytes::new(&ov_header_bytes),
+            ),
+            buffer.by_ref(),
+        )?;
         std::io::copy(&mut &buffer[..], &mut std::io::BufWriter::new(writer))?;
         Ok(())
     }
@@ -87,8 +100,12 @@ impl crate::Serializable for SetCredentials {
     where
         R: std::io::Read,
     {
-        // Go sends array(1): [Bstr(OVHeader)]
-        let (ov_header_bytes,): (serde_bytes::ByteBuf,) = ciborium::de::from_reader(&mut reader)?;
+        // FDO 2.0: [CapabilityFlags, VendorCapFlags, bstr .cbor OVHeader]
+        let (_caps, _vendor_caps, ov_header_bytes): (
+            serde_bytes::ByteBuf,
+            Vec<String>,
+            serde_bytes::ByteBuf,
+        ) = ciborium::de::from_reader(&mut reader)?;
         let ov_header = OwnershipVoucherHeader::deserialize_from_reader(&ov_header_bytes[..])?;
         Ok(SetCredentials { ov_header })
     }
@@ -250,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_app_start_with_device_mfg_info() {
-        // Verify AppStart wraps DeviceMfgInfo in a bstr, producing array(2)
+        // Spec: [CapabilityFlags (bstr), VendorCapFlags ([* tstr]), DeviceMfgInfo (bstr)]
         let info = DeviceMfgInfo::new(
             PublicKeyType::SECP384R1,
             PublicKeyEncoding::X509,
@@ -264,18 +281,17 @@ mod tests {
 
         println!("AppStart hex: {}", hex::encode(&serialized));
 
-        // First byte 0x82 = CBOR array(2)
-        assert_eq!(
-            serialized[0], 0x82,
-            "AppStart must serialize as CBOR array(2)"
+        let elems: Vec<ciborium::Value> = ciborium::de::from_reader(&serialized[..]).unwrap();
+        assert_eq!(elems.len(), 3, "AppStart must serialize as CBOR array(3)");
+        assert!(
+            elems[0].is_bytes(),
+            "element 0 must be CapabilityFlags bstr"
         );
-
-        // Second byte must be a CBOR bstr (major type 2 = 0x40..0x5b)
-        let major_type = serialized[1] >> 5;
-        assert_eq!(
-            major_type, 2,
-            "First element must be a CBOR byte string (bstr)"
+        assert!(
+            elems[1].is_array(),
+            "element 1 must be VendorCapFlags array"
         );
+        assert!(elems[2].is_bytes(), "element 2 must be DeviceMfgInfo bstr");
 
         // Roundtrip: deserialize and check structure
         let deserialized = AppStart::deserialize_from_reader(&serialized[..]).unwrap();

@@ -338,6 +338,24 @@ pub const CAPB0_SUP_FDO20: u8 = 1 << 2; // bit 2: Sender supports FDO 2.0
 pub const DELEGATE_SUPPORT: u8 = 1 << 7; // bit 7: Delegate support
 
 impl CapabilityFlags {
+    /// Split into the two top-level wire fields used by FDO 2.0 messages:
+    /// CapabilityFlags (bstr) and VendorCapFlags ([* tstr]).
+    pub fn into_parts(self) -> (Vec<u8>, Vec<String>) {
+        (self.flags, self.vendor_unique.unwrap_or_default())
+    }
+
+    /// Rebuild from the two top-level wire fields.
+    pub fn from_parts(flags: &[u8], vendor_cap_flags: &[String]) -> Self {
+        Self {
+            flags: flags.to_vec(),
+            vendor_unique: if vendor_cap_flags.is_empty() {
+                None
+            } else {
+                Some(vendor_cap_flags.to_vec())
+            },
+        }
+    }
+
     /// Create capability flags for FDO 2.0 client (no delegate support by default)
     pub fn new_v20_client() -> Self {
         Self {
@@ -918,10 +936,50 @@ impl TO0Data {
     }
 }
 
-#[derive(Debug, Serialize_tuple, Deserialize)]
+/// to1dBlobPayload. FDO 2.0 adds a third element,
+/// `DelegateChain .cbor CertChainOrNull`; blobs created for FDO 1.x vouchers
+/// have only the first two. Both forms are accepted.
+#[derive(Debug, Serialize_tuple)]
 pub struct TO1DataPayload {
     to2_addresses: Vec<TO2AddressEntry>,
     to1d_to_to0d_hash: Hash,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delegate_chain: Option<ByteBuf>,
+}
+
+impl<'de> Deserialize<'de> for TO1DataPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = TO1DataPayload;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a to1d payload array of 2 or 3 elements")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<TO1DataPayload, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let to2_addresses = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let to1d_to_to0d_hash = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let delegate_chain = seq.next_element()?;
+                Ok(TO1DataPayload {
+                    to2_addresses,
+                    to1d_to_to0d_hash,
+                    delegate_chain,
+                })
+            }
+        }
+        deserializer.deserialize_seq(Visitor)
+    }
 }
 
 impl TO1DataPayload {
@@ -929,6 +987,16 @@ impl TO1DataPayload {
         TO1DataPayload {
             to2_addresses,
             to1d_to_to0d_hash,
+            delegate_chain: None,
+        }
+    }
+
+    /// Delegate chain (DER certificates, leaf first) from an FDO 2.0 blob,
+    /// or None when the Owner signed it (or for an FDO 1.x blob).
+    pub fn delegate_chain(&self) -> Result<Option<Vec<ByteBuf>>, Error> {
+        match &self.delegate_chain {
+            None => Ok(None),
+            Some(wrapped) => Ok(serde_cbor::from_slice::<Option<Vec<ByteBuf>>>(wrapped)?),
         }
     }
 
@@ -1033,7 +1101,7 @@ impl TO2ProveDevice20Payload {
 // Contains server's key exchange parameter B.
 #[derive(Debug)]
 pub struct TO2ProveOVHdr20Payload {
-    contents: ParsedArray<crate::cborparser::ParsedArraySize6>,
+    contents: ParsedArray<crate::cborparser::ParsedArraySize8>,
 
     cached_ov_header: ByteBuf,
     cached_num_ov_entries: u8,
@@ -1041,6 +1109,7 @@ pub struct TO2ProveOVHdr20Payload {
     cached_nonce_to2_prove_ov: Nonce,
     cached_xb_key_exchange: ByteBuf,
     cached_max_owner_message_size: u16,
+    cached_delegate_chain: Option<Vec<ByteBuf>>,
 }
 
 impl Serializable for TO2ProveOVHdr20Payload {
@@ -1056,6 +1125,9 @@ impl Serializable for TO2ProveOVHdr20Payload {
         let cached_nonce_to2_prove_ov = contents.get(3)?;
         let cached_xb_key_exchange = contents.get(4)?;
         let cached_max_owner_message_size = contents.get(5)?;
+        // Element 6 is OwnerPubKey (the device derives the Owner key from the
+        // voucher); element 7 is DelegateChain (CertChainOrNull).
+        let cached_delegate_chain = contents.get(7)?;
 
         Ok(TO2ProveOVHdr20Payload {
             contents,
@@ -1065,6 +1137,7 @@ impl Serializable for TO2ProveOVHdr20Payload {
             cached_nonce_to2_prove_ov,
             cached_xb_key_exchange,
             cached_max_owner_message_size,
+            cached_delegate_chain,
         })
     }
 
@@ -1077,6 +1150,11 @@ impl Serializable for TO2ProveOVHdr20Payload {
 }
 
 impl TO2ProveOVHdr20Payload {
+    /// Delegate chain (DER certificates, leaf first), if a Delegate signed.
+    pub fn delegate_chain(&self) -> Option<&[ByteBuf]> {
+        self.cached_delegate_chain.as_deref()
+    }
+
     pub fn ov_header(&self) -> &[u8] {
         &self.cached_ov_header
     }

@@ -11,7 +11,18 @@ pub struct ErrorMessage {
     previous_message_type: MessageType,
     error_string: String,
     error_timestamp: Option<serde_cbor::Value>,
+    // EMErrorCID: always sent as a uint (0 = none); a null from older
+    // implementations is accepted as 0 (FDO 2.0 Errata 1, E4).
+    #[serde(deserialize_with = "deserialize_cid")]
     error_uuid: u128,
+}
+
+fn deserialize_cid<'de, D>(deserializer: D) -> Result<u128, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let cid: Option<u128> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(cid.unwrap_or(0))
 }
 
 impl ErrorMessage {
@@ -119,5 +130,24 @@ mod test {
         assert_eq!(error_message.previous_message_type(), previous_message_type);
         assert_eq!(error_message.error_string(), error_string);
         assert_eq!(error_message.error_uuid(), error_uuid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Serializable;
+
+    #[test]
+    fn test_error_cid_null_accepted_as_zero() {
+        // [101, 82, "x", null, null]
+        let msg = ErrorMessage::deserialize_data(&[0x85, 0x18, 0x65, 0x18, 0x52, 0x61, b'x', 0xf6, 0xf6])
+            .unwrap();
+        assert_eq!(msg.error_uuid, 0);
+        // Sent as a uint
+        let out = ErrorMessage::new(ErrorCode::InternalServerError, MessageType::TO2Done20, String::new(), 0)
+            .serialize_data()
+            .unwrap();
+        assert_eq!(*out.last().unwrap(), 0x00);
     }
 }

@@ -29,9 +29,12 @@ pub(crate) const MAX_MESSAGE_SIZE: u16 = u16::MAX;
 // ============================================================
 // Type 80: TO2.HelloDeviceProbe (Device -> Owner)
 // ============================================================
+// Spec: [CapabilityFlags, VendorCapFlags, Guid, maxDeviceMessageSize, hashTypes, sugar]
 #[derive(Debug, Serialize_tuple, Deserialize)]
 pub struct HelloDeviceProbe {
-    capability_flags: CapabilityFlags,
+    #[serde(with = "serde_bytes")]
+    capability_flags: Vec<u8>,
+    vendor_cap_flags: Vec<String>,
     guid: Guid,
     max_device_message_size: u16,
     hash_types: Vec<i8>, // HashType values (Sha256=-16, Sha384=-43)
@@ -46,8 +49,10 @@ impl HelloDeviceProbe {
         hash_types: Vec<i8>,
         sugar: Vec<u8>,
     ) -> Self {
+        let (capability_flags, vendor_cap_flags) = capability_flags.into_parts();
         HelloDeviceProbe {
             capability_flags,
+            vendor_cap_flags,
             guid,
             max_device_message_size: MAX_MESSAGE_SIZE,
             hash_types,
@@ -59,8 +64,8 @@ impl HelloDeviceProbe {
         &self.guid
     }
 
-    pub fn capability_flags(&self) -> &CapabilityFlags {
-        &self.capability_flags
+    pub fn capability_flags(&self) -> CapabilityFlags {
+        CapabilityFlags::from_parts(&self.capability_flags, &self.vendor_cap_flags)
     }
 }
 
@@ -87,9 +92,13 @@ impl ClientMessage for HelloDeviceProbe {}
 // ============================================================
 // Type 81: TO2.HelloDeviceAck20 (Owner -> Device)
 // ============================================================
+// Spec: [CapabilityFlags, VendorCapFlags, Guid, maxOwnerMessageSize, kex, ciphers,
+//        NonceTO2ProveDV_Prep, hashPrev]
 #[derive(Debug, Serialize_tuple, Deserialize)]
 pub struct HelloDeviceAck20 {
-    capability_flags: CapabilityFlags,
+    #[serde(with = "serde_bytes")]
+    capability_flags: Vec<u8>,
+    vendor_cap_flags: Vec<String>,
     guid: Guid,
     max_owner_message_size: u16,
     kex_suites: Vec<KexSuite>,
@@ -99,8 +108,8 @@ pub struct HelloDeviceAck20 {
 }
 
 impl HelloDeviceAck20 {
-    pub fn capability_flags(&self) -> &CapabilityFlags {
-        &self.capability_flags
+    pub fn capability_flags(&self) -> CapabilityFlags {
+        CapabilityFlags::from_parts(&self.capability_flags, &self.vendor_cap_flags)
     }
 
     pub fn guid(&self) -> &Guid {
@@ -352,17 +361,22 @@ impl ServerMessage for OVNextEntry20 {}
 
 // ============================================================
 // Type 86: TO2.DeviceSvcInfoRdy20 (Device -> Owner)
-// ENCRYPTED. No HMAC here - moved to Done20.
+// ENCRYPTED. The ReplacementHMac field is not used (FDO 2.0 Errata 1):
+// always null, ignored by the Owner. The HMAC is carried in Done20.
 // ============================================================
 #[derive(Debug, Serialize_tuple, Deserialize)]
 pub struct DeviceSvcInfoRdy20 {
+    replacement_hmac: Option<HMac>,
     max_owner_service_info_sz: Option<u16>,
+    nonce_to2_setup_dv_prep: Nonce,
 }
 
 impl DeviceSvcInfoRdy20 {
-    pub fn new(max_owner_service_info_sz: Option<u16>) -> Self {
+    pub fn new(max_owner_service_info_sz: Option<u16>, nonce_to2_setup_dv_prep: Nonce) -> Self {
         DeviceSvcInfoRdy20 {
+            replacement_hmac: None,
             max_owner_service_info_sz,
+            nonce_to2_setup_dv_prep,
         }
     }
 }
@@ -392,66 +406,49 @@ impl ClientMessage for DeviceSvcInfoRdy20 {}
 
 // ============================================================
 // Type 87: TO2.SetupDevice20 (Owner -> Device)
-// ENCRYPTED. Provides replacement credentials.
-// Custom Serializable to handle CBOR array encoding from Go.
+// ENCRYPTED. A COSE_Sign1 over TO2SetupDevice20Payload. For DispResale it
+// is signed by the Owner2 key; otherwise by the ProveOVHdr20 signer
+// (FDO 2.0 Errata 1).
 // ============================================================
 #[derive(Debug)]
-pub struct SetupDevice20 {
-    nonce_to2_setup_dv: Nonce,
-    replacement_guid: Option<Guid>,
-    replacement_rv_info: Option<RendezvousInfo>,
-    max_device_service_info_sz: u16,
-}
+pub struct SetupDevice20(COSESign);
 
-impl crate::Serializable for SetupDevice20 {
-    fn deserialize_from_reader<R>(reader: R) -> Result<Self, crate::Error>
-    where
-        R: std::io::Read,
-    {
-        use crate::cborparser::{ParsedArray, ParsedArraySize4};
-        let arr: ParsedArray<ParsedArraySize4> = ParsedArray::deserialize_from_reader(reader)?;
-        Ok(Self {
-            nonce_to2_setup_dv: arr.get(0)?,
-            replacement_guid: arr.get(1)?,
-            replacement_rv_info: arr.get(2)?,
-            max_device_service_info_sz: arr.get(3)?,
-        })
-    }
-
-    fn deserialize_data(data: &[u8]) -> Result<Self, crate::Error> {
-        Self::deserialize_from_reader(data)
-    }
-
-    fn serialize_to_writer<W>(&self, writer: W) -> Result<(), crate::Error>
-    where
-        W: std::io::Write,
-    {
-        use crate::cborparser::{ParsedArrayBuilder, ParsedArraySize4};
-        let mut arr = ParsedArrayBuilder::<ParsedArraySize4>::new();
-        arr.set(0, &self.nonce_to2_setup_dv)?;
-        arr.set(1, &self.replacement_guid)?;
-        arr.set(2, &self.replacement_rv_info)?;
-        arr.set(3, &self.max_device_service_info_sz)?;
-        arr.build().serialize_to_writer(writer)
-    }
-}
+simple_message_serializable!(SetupDevice20, COSESign);
 
 impl SetupDevice20 {
-    pub fn nonce_to2_setup_dv(&self) -> &Nonce {
-        &self.nonce_to2_setup_dv
+    pub fn new(token: COSESign) -> Self {
+        SetupDevice20(token)
     }
 
-    pub fn replacement_guid(&self) -> Option<&Guid> {
-        self.replacement_guid.as_ref()
+    pub fn token(&self) -> &COSESign {
+        &self.0
     }
 
-    pub fn replacement_rv_info(&self) -> Option<&RendezvousInfo> {
-        self.replacement_rv_info.as_ref()
+    pub fn into_token(self) -> COSESign {
+        self.0
     }
+}
 
-    pub fn max_device_service_info_sz(&self) -> u16 {
-        self.max_device_service_info_sz
-    }
+/// SetupDevice20 DispositionCode values.
+pub const DISP_RESALE: u8 = 1;
+pub const DISP_CRED_REUSE: u8 = 2;
+pub const DISP_DISABLE: u8 = 3;
+
+/// ReplacementCred of TO2.SetupDevice20 (DispResale only).
+#[derive(Debug, Serialize_tuple, Deserialize)]
+pub struct ReplacementCred20 {
+    pub rendezvous_info: RendezvousInfo,
+    pub guid: Guid,
+    pub nonce_to2_setup_dv: Nonce,
+    pub owner2_pub_key: crate::publickey::PublicKey,
+}
+
+/// Payload of TO2.SetupDevice20.
+#[derive(Debug, Serialize_tuple, Deserialize)]
+pub struct TO2SetupDevice20Payload {
+    pub disposition_code: u8,
+    pub replacement_cred: Option<ReplacementCred20>,
+    pub max_device_service_info_sz: Option<u16>,
 }
 
 impl Message for SetupDevice20 {
@@ -480,6 +477,7 @@ impl ServerMessage for SetupDevice20 {}
 // ============================================================
 #[derive(Debug, Serialize_tuple, Deserialize)]
 pub struct DeviceSvcInfo20 {
+    replacement_hmac_or_null: Option<HMac>, // Not used (FDO 2.0 Errata 1): always null
     is_more_service_info: bool,
     service_info: ServiceInfo,
 }
@@ -487,6 +485,7 @@ pub struct DeviceSvcInfo20 {
 impl DeviceSvcInfo20 {
     pub fn new(is_more_service_info: bool, service_info: ServiceInfo) -> Self {
         DeviceSvcInfo20 {
+            replacement_hmac_or_null: None,
             is_more_service_info,
             service_info,
         }
@@ -571,25 +570,25 @@ impl ServerMessage for OwnerSvcInfo20 {}
 
 // ============================================================
 // Type 90: TO2.Done20 (Device -> Owner)
-// ENCRYPTED. ReplacementHMAC sent HERE (not in DeviceSvcInfoRdy20)
-// so client can compute it after receiving GUID/RvInfo from SetupDevice20.
+// ENCRYPTED. The only message carrying the ReplacementHMac (FDO 2.0
+// Errata 1), sent after the Device received the new credentials.
 // ============================================================
 #[derive(Debug, Serialize_tuple, Deserialize)]
 pub struct Done20 {
-    nonce_to2_setup_dv: Nonce,
+    nonce_to2_prove_dv: Nonce,
     replacement_hmac: Option<HMac>,
 }
 
 impl Done20 {
-    pub fn new(nonce_to2_setup_dv: Nonce, replacement_hmac: Option<HMac>) -> Self {
+    pub fn new(nonce_to2_prove_dv: Nonce, replacement_hmac: Option<HMac>) -> Self {
         Done20 {
-            nonce_to2_setup_dv,
+            nonce_to2_prove_dv,
             replacement_hmac,
         }
     }
 
-    pub fn nonce_to2_setup_dv(&self) -> &Nonce {
-        &self.nonce_to2_setup_dv
+    pub fn nonce_to2_prove_dv(&self) -> &Nonce {
+        &self.nonce_to2_prove_dv
     }
 
     pub fn replacement_hmac(&self) -> Option<&HMac> {
@@ -626,12 +625,12 @@ impl ClientMessage for Done20 {}
 // ============================================================
 #[derive(Debug, Serialize_tuple, Deserialize)]
 pub struct DoneAck20 {
-    nonce_to2_prove_ov: Nonce,
+    nonce_to2_setup_dv: Nonce,
 }
 
 impl DoneAck20 {
-    pub fn nonce_to2_prove_ov(&self) -> &Nonce {
-        &self.nonce_to2_prove_ov
+    pub fn nonce_to2_setup_dv(&self) -> &Nonce {
+        &self.nonce_to2_setup_dv
     }
 }
 

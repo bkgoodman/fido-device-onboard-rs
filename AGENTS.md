@@ -13,6 +13,9 @@ This document provides guidance for AI agents and automated tools working with t
 - **ALWAYS test before claiming functionality works** - Run relevant test suites
 - **ALWAYS run linters before check-in** - Use `cargo clippy` and `cargo fmt`
 - **DO NOT make unproductive loops** - If repeatedly fixing issues, comment and move on
+- **Known deficiencies are tracked in `TODO.md`** (security gaps in delegate
+  and BMO handling, unsupported protocol options). Check it before assuming a
+  feature is implemented, and add to it rather than leaving gaps undocumented.
 
 ### Testing Guidelines
 
