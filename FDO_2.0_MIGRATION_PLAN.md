@@ -86,6 +86,7 @@ owner server to deliver boot images, BIOS parameters, and Secure Boot keys to
 the device during onboarding via the ServiceInfo exchange (messages 88/89).
 
 **Device-side (client-linuxapp) -- implemented:**
+
 - [x] Register `fdo.bmo` module (`FdoServiceInfoModule::Bmo` in serviceinfo_names.rs)
 - [x] Advertise `fdo.bmo` module in devmod active modules list
 - [x] Handle `fdo.bmo:active` (enable/disable BMO module via `active_modules` set)
@@ -125,6 +126,7 @@ platform"):
 - [ ] COSE Sign1 signature verification for signed meta-payloads
 
 **Key Go server flags for testing:**
+
 ```bash
 # Send boot image file to device
 go run ./cmd server -bmo-file /path/to/image.iso -bmo-type application/x-iso9660-image
@@ -142,6 +144,7 @@ go run ./cmd server -bmo-meta-url "http://example.com/meta.json:signer.key:ca.pe
 ## Phase 5: Code Cleanup
 
 ### 5a: Remove Server Code
+
 - [x] Remove server crates
   - [x] `rendezvous-server/`
   - [x] `manufacturing-server/`
@@ -160,6 +163,7 @@ go run ./cmd server -bmo-meta-url "http://example.com/meta.json:signer.key:ca.pe
 - [ ] Update `README.md` (remove legacy crate references)
 
 ### 5c: Remove Unnecessary FSIMs (DONE)
+
 Only `devmod` (required by protocol) and `fdo.bmo` (bare metal onboarding) are
 needed for the target environments (firmware, UEFI, OS installer). All other
 FSIMs are Linux-specific and assume a running OS -- the opposite of our use case.
@@ -177,6 +181,7 @@ FSIMs are Linux-specific and assume a running OS -- the opposite of our use case
 - [x] Remove `reencrypt` module from `client-linuxapp`
 
 ### 5b: Warnings & Linting (DONE)
+
 - [x] `cargo clippy` clean (zero warnings across all workspace crates)
 - [x] `cargo fmt --all` applied
 - [x] Fix all unused imports, unused variables, unnecessary unwrap calls
@@ -276,6 +281,7 @@ different TPM libraries, `tss-esapi` is useless.
 The existing abstraction is clean (3 enums: `KeyStorageType`, `KeyStorage`,
 `KeyReference` with filesystem/TPM variants). The TPM code is concentrated
 in two files (~450 lines total):
+
 - `data-formats/src/devicecredential/file.rs` -- `TpmCoseSigner`, HMAC, signing (~250 lines)
 - `manufacturing-client/src/main.rs` -- Key generation, templates, public key extraction (~200 lines)
 
@@ -296,6 +302,7 @@ in two files (~450 lines total):
 - [x] Test DI with `--key-ref tpm` works with TPM feature -- DI + TO1 + TO2 against Go server (P-256, real hardware TPM)
 
 **Additional fixes during TPM testing:**
+
 - [x] Fix `str_key()` and `env_key()` to route `--key-ref tpm` to `get_new_key_tpm()` (was dead code)
 - [x] Auto-detect TPM curve support (try P-256 first, fall back to P-384)
 - [x] Detect actual key type from TPM public key in `get_public_key_type()` (was hardcoded P-384)
@@ -324,6 +331,7 @@ boundary. The TPM-specific part is below that.
 ### 8c: New TPM spec alignment
 
 **Completed: NV-based credential storage (DI side) — OLD MULTI-NV MODEL**
+
 - [x] New `data-formats/src/tpm/` module: `mod.rs` (constants, profiles, context), `nv.rs` (NV operations), `key.rs` (key management)
 - [x] NV index constants matching Go: `0x01D10000`-`0x01D10005` (DCActive, DCTPM, DCOV, US indices)
 - [x] Persistent handle constants: `0x81020002` (DAK), `0x81020003` (HMAC key)
@@ -340,11 +348,12 @@ boundary. The TPM-specific part is below that.
 The Go library (`go-fdo`) has been updated to store ALL FDO credentials in a
 single DCTPM NV index as a CBOR structure with a magic header ("FDO1" = 0x46444F31).
 The old multi-NV model (DCActive + DCTPM + DCOV as separate indices) is obsolete.
-The Rust code still uses the old model and needs to be updated.
-
-See `TPM_NV_CONSOLIDATION_TODO.md` for the full migration guide.
+The Rust code has since been migrated (DI writes the "FDO1" CBOR in
+`manufacturing-client`; `data-formats/src/tpm/{credential,nv}.rs` read it).
+The migration guide `TPM_NV_CONSOLIDATION_TODO.md` was removed 2026-10-08.
 
 Key changes:
+
 - Single NV index (0x01D10001) replaces 3 separate indices
 - CBOR structure includes Magic, Active, GUID, DeviceInfo, RvInfo, key handles
 - DCActive is now a field inside the CBOR, not a separate NV index
@@ -353,12 +362,14 @@ Key changes:
 - Key handles recorded in DCTPM, not assumed to be at well-known handles
 
 **Remaining: Consolidation migration**
-- [ ] Update Rust constants/structs to match new single-NV model (see TPM_NV_CONSOLIDATION_TODO.md)
-- [ ] Update DI write path for consolidated CBOR format with magic
-- [ ] Update credential load path to read consolidated format
+
+- [x] Update Rust constants/structs to match new single-NV model
+- [x] Update DI write path for consolidated CBOR format with magic
+- [x] Update credential load path to read consolidated format
 - [ ] Update TO2 credential update to write consolidated format
 
 **Remaining: TO2 side (load from NV)**
+
 - [ ] Update `client-linuxapp` to discover and load credentials from TPM NV indices
 - [ ] Read DCTPM/DCOV/DCActive from NV → reconstruct DeviceCredential
 - [ ] Load persistent DAK/HMAC key handles for TO1/TO2 signing
@@ -366,6 +377,7 @@ Key changes:
 - [ ] Credential reuse: Save() updates NV indices after TO2
 
 **Deferred (policy session hardening):**
+
 - [ ] `userWithAuth=false` with PolicyNV + PolicySecret (tss-esapi 7.6 missing `PolicyNV`; using password auth)
 - [ ] HMAC sequence operations (tss-esapi 7.6 missing `HMAC_Start`/`SequenceUpdate`/`SequenceComplete`)
 - [ ] PCR quotes during TO2 (not in current Go implementation either)
