@@ -84,6 +84,11 @@ start_go_server() {
 	done
 
 	log_info "Starting server process..."
+	# -lenient-kex: client-linuxapp always selects ECDH384 instead of choosing
+	# from the HelloDeviceAck20 offer, which is not spec compliant for P-256
+	# keys (see TODO.md P4). Override with GO_SERVER_KEX_FLAGS="" to test the
+	# spec-strict server.
+	flags="${GO_SERVER_KEX_FLAGS--lenient-kex} $flags"
 	# shellcheck disable=SC2086
 	(cd "$GO_FDO_DIR/examples" && go run ./cmd server -http "$SERVER_ADDR" -ext-http "$SERVER_ADDR" -db "$DB_FILE" $flags >$EPHEMERAL_DIR/fdo_server.log 2>&1) &
 	SERVER_PID=$!

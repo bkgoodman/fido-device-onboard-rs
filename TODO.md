@@ -72,6 +72,18 @@ Only the first rendezvous blob of `TO1.RVRedirect` is used; a partial list
 ### P3. DispDisable not supported
 A `TO2.SetupDevice20` with `DispDisable` fails TO2.
 
+### P4. TO2 key exchange suite is hard-coded to ECDH384
+`client-linuxapp` always sends `ECDH384` in `TO2.ProveDevice20` and ignores
+the suites the Owner offers in `TO2.HelloDeviceAck20`. The spec only allows
+ECDH384 for a P-384 Owner key (ECDH256 for P-256, DHKEX for RSA). go-fdo's
+2.0 server now offers and enforces the spec mapping, so with P-256 keys it
+rejects this client at msg 82 ("key exchange ECDH384 is invalid for the
+device and owner attestation types"). `test_rust_fdo20_interop.sh` therefore
+starts the go-fdo server with `-lenient-kex` (not spec compliant; accepts any
+ECDH suite for an ECDSA Owner key). Fix: select a suite from the offer, then
+drop the flag (`GO_SERVER_KEX_FLAGS="" ./test_rust_fdo20_interop.sh` runs
+against the strict server).
+
 ## Housekeeping
 
 - `cargo test -p fdo-data-formats` alone fails to compile (feature

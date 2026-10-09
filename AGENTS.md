@@ -26,6 +26,9 @@ This document provides guidance for AI agents and automated tools working with t
 - **Interoperability testing required** for protocol changes:
   - FDO 2.0 interop: `./test_rust_fdo20_interop.sh` (tests Rust client vs Go server)
   - Requires `../go-fdo` directory
+  - Starts the go-fdo server with `-lenient-kex` because client-linuxapp
+    hard-codes ECDH384 (not spec compliant for P-256 keys; see `TODO.md` P4).
+    `GO_SERVER_KEX_FLAGS="" ./test_rust_fdo20_interop.sh` tests the strict server.
 
 ### Code Quality Standards
 
