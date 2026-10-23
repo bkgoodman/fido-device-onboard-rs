@@ -84,6 +84,42 @@ ECDH suite for an ECDSA Owner key). Fix: select a suite from the offer, then
 drop the flag (`GO_SERVER_KEX_FLAGS="" ./test_rust_fdo20_interop.sh` runs
 against the strict server).
 
+### P5. FDO 2.0 ECDH `ShSe` built in go-fdo's (wrong) order
+`client-linuxapp/src/main.rs` (~657) derives the 2.0 session keys with
+`KeyDeriveSide::OwnerService` to match go-fdo's positional
+`Shx || xB.Rand || xA.Rand`. The spec order is by role,
+`Shx || DeviceRandom || OwnerRandom`, which `derive_key_ecdh` already does
+for `KeyDeriveSide::Device`. Fix: pass `KeyDeriveSide::Device`, in the same
+change as go-fdo and fdo-uefi-rs (flag day). Cross-repo tracking:
+workstream `fdo20-spec-issues`; spec background (editorial A/B prose fix)
+filed in the upstream spec tracker 2026-10-24.
+
+## TPM spec alignment (opened 2026-10-24)
+
+Spec: `~/internet-of-things-specs/securing-fdo-in-tpm.bs`, branch
+`bgoodman-tpm` (pushed through 522feec). Same items are tracked in go-fdo and
+fdo-uefi-rs TODO.md "TPM spec alignment"; cross-repo workstream
+`impl-alignment`.
+
+### T1. Device key authPolicy = `PolicyCommandCode(TPM_CC_Certify)`
+Spec Table 10/12 (adopted 2026-10-23, SHOULD). The DAK templates in
+`data-formats/src/tpm/key.rs` and `manufacturing-client` (`SpecTpm` flow) set
+an empty authPolicy; set the digest for the key's nameAlg (SHA256
+`048e9a3a…65850`, SHA384 `a7108d53…1019a`). HMAC key stays empty. Only new
+DI is affected (signing uses the USER role and the persisted handle; existing
+keys with an empty policy stay compliant). Test: `TPM2_Certify(DAK, AK)`
+succeeds via a policy session, `TPM2_ObjectChangeAuth` fails, signing still
+works with an empty password.
+
+### T2. `noDA = 1` on the DAK and HMAC key
+Spec Table 11. Check the templates in `data-formats/src/tpm/key.rs`.
+
+### T3. Dead PolicyNV workaround
+`data-formats/src/tpm/policy.rs` (`compute_fdo_auth_policy`, the second raw
+ESYS connection for `Esys_PolicyNV`) is no longer called from outside the
+file, and the spec no longer uses PolicyNV. Delete it and the AGENTS.md
+"TPM PolicyNV Workaround" section together.
+
 ## Housekeeping
 
 - `cargo test -p fdo-data-formats` alone fails to compile (feature
