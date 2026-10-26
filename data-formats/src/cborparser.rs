@@ -939,3 +939,35 @@ mod test {
         );
     }
 }
+
+/// Decode the first CBOR data item in `data` and ignore any bytes after it.
+///
+/// Used for the DCTPM NV index: the index may be larger than the DCTPM
+/// structure, and readers SHALL ignore the bytes that follow it (FDO TPM spec,
+/// DCTPM sizing). `serde_cbor::from_slice` rejects trailing data.
+pub fn decode_first_cbor_value(data: &[u8]) -> Result<serde_cbor::Value, serde_cbor::Error> {
+    let mut de = serde_cbor::Deserializer::from_slice(data);
+    serde::Deserialize::deserialize(&mut de)
+}
+
+#[cfg(test)]
+mod test_decode_first {
+    use super::decode_first_cbor_value;
+
+    #[test]
+    fn ignores_trailing_bytes() {
+        let item = serde_cbor::to_vec(&serde_cbor::Value::Array(vec![
+            serde_cbor::Value::Integer(0x46444F31),
+            serde_cbor::Value::Bool(true),
+        ]))
+        .unwrap();
+        let mut padded = item.clone();
+        padded.resize(512, 0);
+        assert_eq!(
+            decode_first_cbor_value(&padded).unwrap(),
+            decode_first_cbor_value(&item).unwrap()
+        );
+        // serde_cbor::from_slice is what the readers used before: it fails.
+        assert!(serde_cbor::from_slice::<serde_cbor::Value>(&padded).is_err());
+    }
+}

@@ -74,7 +74,8 @@ impl TpmDeviceCredential {
         //   [0]=Magic, [1]=Active, [2]=Version, [3]=DeviceInfo, [4]=GUID,
         //   [5]=RvInfo, [6]=PubKeyHash, [7]=KeyType, [8]=DAKHandle, [9]=HMACHandle
         let dctpm: serde_cbor::Value =
-            serde_cbor::from_slice(&info.raw_dctpm).map_err(Error::SerdeCborError)?;
+            crate::cborparser::decode_first_cbor_value(&info.raw_dctpm)
+                .map_err(Error::SerdeCborError)?;
 
         let arr = match &dctpm {
             serde_cbor::Value::Array(arr) if arr.len() >= 8 => arr,

@@ -84,7 +84,9 @@ ECDH suite for an ECDSA Owner key). Fix: select a suite from the offer, then
 drop the flag (`GO_SERVER_KEX_FLAGS="" ./test_rust_fdo20_interop.sh` runs
 against the strict server).
 
-### P5. FDO 2.0 ECDH `ShSe` built in go-fdo's (wrong) order
+### P5. FDO 2.0 ECDH `ShSe` built in go-fdo's (wrong) order — FIXED 2026-10-24
+Fixed (uncommitted): client passes `KeyDeriveSide::Device`; KAT
+`types::test_ecdh_kat` (shared vectors, both sides); interop 7/7 vs fixed go-fdo.
 `client-linuxapp/src/main.rs` (~657) derives the 2.0 session keys with
 `KeyDeriveSide::OwnerService` to match go-fdo's positional
 `Shx || xB.Rand || xA.Rand`. The spec order is by role,
@@ -101,7 +103,10 @@ Spec: `~/internet-of-things-specs/securing-fdo-in-tpm.bs`, branch
 fdo-uefi-rs TODO.md "TPM spec alignment"; cross-repo workstream
 `impl-alignment`.
 
-### T1. Device key authPolicy = `PolicyCommandCode(TPM_CC_Certify)`
+### T1. Device key authPolicy = `PolicyCommandCode(TPM_CC_Certify)` — code done 2026-10-24
+Code written (uncommitted): `tpm::key::device_key_auth_policy` + both EC
+templates. **Not compiled or run**: devvm has no `libtss2-dev` / TPM
+(`cargo test --features tpm_support` fails in tss-esapi-sys).
 Spec Table 10/12 (adopted 2026-10-23, SHOULD). The DAK templates in
 `data-formats/src/tpm/key.rs` and `manufacturing-client` (`SpecTpm` flow) set
 an empty authPolicy; set the digest for the key's nameAlg (SHA256
@@ -111,8 +116,13 @@ keys with an empty policy stay compliant). Test: `TPM2_Certify(DAK, AK)`
 succeeds via a policy session, `TPM2_ObjectChangeAuth` fails, signing still
 works with an empty password.
 
-### T2. `noDA = 1` on the DAK and HMAC key
+### T2. `noDA = 1` on the DAK and HMAC key — code done 2026-10-24 (same caveat as T1)
 Spec Table 11. Check the templates in `data-formats/src/tpm/key.rs`.
+
+### T4. DCTPM readers ignore trailing bytes — code done 2026-10-26
+`cborparser::decode_first_cbor_value` (tested) now used by `tpm/nv.rs` and
+`tpm/credential.rs` (spec: index MAY be larger than DCTPM; go-fdo now
+defines it at 512). Call sites not compiled here (tpm_support, see T1).
 
 ### T3. Dead PolicyNV workaround
 `data-formats/src/tpm/policy.rs` (`compute_fdo_auth_policy`, the second raw

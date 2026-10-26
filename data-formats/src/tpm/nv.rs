@@ -207,7 +207,7 @@ pub fn read_nv_credentials(ctx: &mut Context) -> Result<NvCredentialInfo, Error>
                 info.has_dctpm = true;
 
                 // Extract Magic [0] and Active [1] from consolidated DCTPM array
-                if let Ok(cbor) = serde_cbor::from_slice::<serde_cbor::Value>(&info.raw_dctpm) {
+                if let Ok(cbor) = crate::cborparser::decode_first_cbor_value(&info.raw_dctpm) {
                     if let serde_cbor::Value::Array(ref arr) = cbor {
                         if arr.len() >= 2 {
                             if let serde_cbor::Value::Integer(m) = &arr[0] {

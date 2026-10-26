@@ -27,12 +27,53 @@ use tss_esapi::{
 
 use crate::errors::Error;
 
+/// Device key authPolicy, FDO TPM spec Table 12:
+/// TPM2_PolicyCommandCode(TPM_CC_Certify) for the key's nameAlg,
+/// H(zero digest || TPM_CC_PolicyCommandCode || TPM_CC_Certify).
+/// Lets any party obtain TPM2_Certify evidence that the key is in this TPM;
+/// every other ADMIN-role command (e.g. TPM2_ObjectChangeAuth) fails it.
+pub fn device_key_auth_policy(name_alg: HashingAlgorithm) -> Result<Digest, Error> {
+    let md = match name_alg {
+        HashingAlgorithm::Sha256 => openssl::hash::MessageDigest::sha256(),
+        HashingAlgorithm::Sha384 => openssl::hash::MessageDigest::sha384(),
+        _ => return Err(Error::UnsupportedAlgorithm),
+    };
+    let mut input = vec![0u8; md.size()];
+    input.extend_from_slice(&0x0000_016Cu32.to_be_bytes()); // TPM_CC_PolicyCommandCode
+    input.extend_from_slice(&0x0000_0148u32.to_be_bytes()); // TPM_CC_Certify
+    let digest = openssl::hash::hash(md, &input)?;
+    Ok(Digest::try_from(digest.to_vec())?)
+}
+
+#[cfg(test)]
+mod test_auth_policy {
+    use super::*;
+
+    #[test]
+    fn device_key_auth_policy_matches_spec_table_12() {
+        assert_eq!(
+            hex::encode(
+                device_key_auth_policy(HashingAlgorithm::Sha256)
+                    .unwrap()
+                    .value()
+            ),
+            "048e9a3ace08583f79f344ff785bbea9f07ac7fa3325b3d49a21dd5194c65850"
+        );
+        assert_eq!(
+            hex::encode(device_key_auth_policy(HashingAlgorithm::Sha384).unwrap().value()),
+            "a7108d531f393410f00d93745061f31f10b50042fdd0e0a0353bd1be088b50acc12cee7ca47caf8a928290beff81019a"
+        );
+    }
+}
+
 /// Generate a spec-compliant ECC signing key under the Endorsement hierarchy.
 ///
 /// Per spec Table 11:
 ///   - UserWithAuth = true (key usage via HMAC session with empty authValue)
 ///   - AdminWithPolicy = true (admin ops require policy session)
-///   - No AuthPolicy required for key usage — empty authValue is sufficient
+///   - NoDA = true
+///   - AuthPolicy = device_key_auth_policy() (Table 12): Certify only; signing
+///     uses the USER role with an empty authValue, never this policy
 ///   - Unique field populated with the unique string bytes
 ///
 /// The key is created as a transient primary under the Endorsement hierarchy.
@@ -56,12 +97,14 @@ pub fn generate_spec_ec_key(
         .with_sign_encrypt(true)
         .with_user_with_auth(true) // per spec Table 11: empty authValue for key usage
         .with_admin_with_policy(true) // per spec Table 11: policy required for admin ops
+        .with_no_da(true) // per spec Table 11
         .build()?;
 
     let builder = PublicBuilder::new()
         .with_public_algorithm(tss_esapi::interface_types::algorithm::PublicAlgorithm::Ecc)
         .with_name_hashing_algorithm(hash_alg)
         .with_object_attributes(obj_attrs)
+        .with_auth_policy(device_key_auth_policy(hash_alg)?)
         .with_ecc_parameters(PublicEccParameters::new(
             SymmetricDefinitionObject::Null,
             EccScheme::EcDsa(HashScheme::new(hash_alg)),
@@ -88,7 +131,8 @@ pub fn generate_spec_ec_key(
 /// Per spec Table 11:
 ///   - UserWithAuth = true (key usage via HMAC session with empty authValue)
 ///   - AdminWithPolicy = true (admin ops require policy session)
-///   - No AuthPolicy required for key usage — empty authValue is sufficient
+///   - NoDA = true
+///   - Empty AuthPolicy (Table 12): no ADMIN role
 ///   - Unique field populated with the unique string bytes
 ///
 /// Returns a transient KeyHandle.
@@ -100,6 +144,7 @@ pub fn generate_spec_hmac_key(ctx: &mut Context, unique_string: &[u8]) -> Result
         .with_sign_encrypt(true)
         .with_user_with_auth(true) // per spec Table 11: empty authValue for key usage
         .with_admin_with_policy(true) // per spec Table 11: policy required for admin ops
+        .with_no_da(true) // per spec Table 11
         .build()?;
 
     let builder = PublicBuilder::new()
@@ -173,20 +218,28 @@ pub fn create_child_ec_key(
     parent: KeyHandle,
     curve: EccCurve,
     hash_alg: HashingAlgorithm,
-) -> Result<(tss_esapi::structures::Private, tss_esapi::structures::Public), Error> {
+) -> Result<
+    (
+        tss_esapi::structures::Private,
+        tss_esapi::structures::Public,
+    ),
+    Error,
+> {
     let obj_attrs = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
         .with_sensitive_data_origin(true)
         .with_sign_encrypt(true)
-        .with_user_with_auth(true)         // per spec Table 11
-        .with_admin_with_policy(true)      // per spec Table 11
+        .with_user_with_auth(true) // per spec Table 11
+        .with_admin_with_policy(true) // per spec Table 11
+        .with_no_da(true) // per spec Table 11
         .build()?;
 
     let template = PublicBuilder::new()
         .with_public_algorithm(tss_esapi::interface_types::algorithm::PublicAlgorithm::Ecc)
         .with_name_hashing_algorithm(hash_alg)
         .with_object_attributes(obj_attrs)
+        .with_auth_policy(device_key_auth_policy(hash_alg)?)
         .with_ecc_parameters(PublicEccParameters::new(
             SymmetricDefinitionObject::Null,
             EccScheme::EcDsa(HashScheme::new(hash_alg)),
@@ -211,14 +264,21 @@ pub fn create_child_ec_key(
 pub fn create_child_hmac_key(
     ctx: &mut Context,
     parent: KeyHandle,
-) -> Result<(tss_esapi::structures::Private, tss_esapi::structures::Public), Error> {
+) -> Result<
+    (
+        tss_esapi::structures::Private,
+        tss_esapi::structures::Public,
+    ),
+    Error,
+> {
     let obj_attrs = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
         .with_sensitive_data_origin(true)
         .with_sign_encrypt(true)
-        .with_user_with_auth(true)         // per spec Table 11
-        .with_admin_with_policy(true)      // per spec Table 11
+        .with_user_with_auth(true) // per spec Table 11
+        .with_admin_with_policy(true) // per spec Table 11
+        .with_no_da(true) // per spec Table 11
         .build()?;
 
     let template = PublicBuilder::new()
@@ -245,9 +305,7 @@ pub fn load_child_key(
     private: tss_esapi::structures::Private,
     public: tss_esapi::structures::Public,
 ) -> Result<KeyHandle, Error> {
-    let handle = ctx.execute_with_nullauth_session(|ctx| {
-        ctx.load(parent, private, public)
-    })?;
+    let handle = ctx.execute_with_nullauth_session(|ctx| ctx.load(parent, private, public))?;
     Ok(handle.into())
 }
 
