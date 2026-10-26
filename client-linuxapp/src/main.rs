@@ -655,10 +655,9 @@ async fn perform_to2(
     let xb_key_exchange = _prove_ov_hdr_payload.xb_key_exchange();
     let new_keys = a_key_exchange
         .derive_key(
-            // In FDO 2.0: device sends A, server sends B.
-            // Go constructs shared secret as [sharedECDH, B_random, A_random].
-            // Using OwnerService side makes Rust put OTHER(B) random first, then OUR(A).
-            KeyDeriveSide::OwnerService,
+            // ShSe = Shx || DeviceRandom || OwnerRandom, by role (FDO spec).
+            // We are the Device; at 2.0 our parameter is xA.
+            KeyDeriveSide::Device,
             ciphersuite,
             xb_key_exchange,
             non_interoperable_kdf_required,

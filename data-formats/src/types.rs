@@ -2712,3 +2712,68 @@ impl TryFrom<RemoteConnection> for Vec<TO2AddressEntry> {
         Ok(results)
     }
 }
+
+// ECDH known-answer vectors shared with go-fdo (kex/ecdh_kat_test.go) and
+// fdo-uefi-rs (fdo.rs tests): device scalar SHA256("fdo-kat-device"), owner
+// scalar SHA256("fdo-kat-owner"), DeviceRandom 0x11*16, OwnerRandom 0x22*16.
+// ShSe = Shx || DeviceRandom || OwnerRandom, by role.
+#[cfg(test)]
+mod test_ecdh_kat {
+    use super::*;
+
+    const SEK_A128GCM: &str = "1e834c3d7a72efe4c35460ab218d53fc";
+    const SEK_A256GCM: &str = "dd637b926fac42795349dc7898447da80c0c829534ba4cf9c4cac0822e5b63e2";
+
+    fn kex_for(label: &[u8], fill: u8) -> KeyExchange {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let scalar = BigNum::from_slice(&hash(MessageDigest::sha256(), label).unwrap()).unwrap();
+        let ctx = BigNumContext::new().unwrap();
+        let mut point = EcPoint::new(&group).unwrap();
+        point.mul_generator(&group, &scalar, &ctx).unwrap();
+        let key = EcKey::from_private_components(&group, &scalar, &point).unwrap();
+        KeyExchange::Ecdh(
+            KexSuite::Ecdh256,
+            key.private_key_to_der().unwrap(),
+            vec![fill; 16],
+        )
+    }
+
+    fn sevk(keys: DerivedKeys) -> String {
+        match keys {
+            DerivedKeys::Combined { sevk } => hex::encode(sevk),
+            DerivedKeys::Split { .. } => panic!("GCM suites use a combined key"),
+        }
+    }
+
+    #[test]
+    fn ecdh256_known_answer_both_sides() {
+        let device = kex_for(b"fdo-kat-device", 0x11);
+        let owner = kex_for(b"fdo-kat-owner", 0x22);
+        let device_param = device.get_public().unwrap();
+        let owner_param = owner.get_public().unwrap();
+        for (cipher, want) in [
+            (CipherSuite::A128Gcm, SEK_A128GCM),
+            (CipherSuite::A256Gcm, SEK_A256GCM),
+        ] {
+            let d = device
+                .derive_key(KeyDeriveSide::Device, cipher, &owner_param, false)
+                .unwrap();
+            assert_eq!(sevk(d), want, "device side, {:?}", cipher as u8);
+            let o = owner
+                .derive_key(KeyDeriveSide::OwnerService, cipher, &device_param, false)
+                .unwrap();
+            assert_eq!(sevk(o), want, "owner side, {:?}", cipher as u8);
+        }
+        // Negative control: the pre-fix choice (Device deriving as OwnerService,
+        // Owner random first) does not produce the spec key.
+        let wrong = device
+            .derive_key(
+                KeyDeriveSide::OwnerService,
+                CipherSuite::A128Gcm,
+                &owner_param,
+                false,
+            )
+            .unwrap();
+        assert_ne!(sevk(wrong), SEK_A128GCM);
+    }
+}
