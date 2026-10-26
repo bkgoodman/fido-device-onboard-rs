@@ -124,6 +124,12 @@ Spec Table 11. Check the templates in `data-formats/src/tpm/key.rs`.
 `tpm/credential.rs` (spec: index MAY be larger than DCTPM; go-fdo now
 defines it at 512). Call sites not compiled here (tpm_support, see T1).
 
+### T5. DCTPM DeviceKeyType holds the protocol key type
+`manufacturing-client` writes `key_type_value` (the FDO protocol key type,
+e.g. 10 = secp256r1) at DCTPM index 7. The TPM spec defines DeviceKeyType as
+0 = DAK, 1 = IDevID, 2 = LDevID; write 0. go-fdo fixed the same deviation
+2026-10-27 (f9fc84d); fdo-uefi-rs already writes 0.
+
 ### T3. Dead PolicyNV workaround
 `data-formats/src/tpm/policy.rs` (`compute_fdo_auth_policy`, the second raw
 ESYS connection for `Esys_PolicyNV`) is no longer called from outside the
