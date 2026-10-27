@@ -1786,7 +1786,8 @@ impl KeyReference {
                 // Build consolidated DCTPM as CBOR array (matching Go keyasint encoding).
                 // Go's fxamacker/cbor encodes keyasint structs as arrays when keys
                 // are sequential from 0. Per spec CDDL: DCTPM = [Magic, Active, Version,
-                // DeviceInfo, GUID, RvInfo, PubKeyHash, KeyType, DeviceKeyHandle, HMACKeyHandle]
+                // DeviceInfo, GUID, RvInfo, PubKeyHash, DeviceKeyType, DeviceKeyHandle,
+                // HMACKeyHandle, DCMinFirmwareRev] (TPM spec ed57e9f)
                 let dctpm_payload = {
                     let dctpm_array = serde_cbor::Value::Array(vec![
                         serde_cbor::Value::Integer(dctpm_magic as i128),       // [0] Magic
@@ -1798,9 +1799,12 @@ impl KeyReference {
                             .unwrap_or(serde_cbor::Value::Array(vec![])),
                         serde_cbor::value::to_value(&manufacturer_public_key_hash) // [6] PubKeyHash
                             .unwrap_or(serde_cbor::Value::Null),
-                        serde_cbor::Value::Integer(key_type_value as i128),     // [7] KeyType
+                        serde_cbor::Value::Integer(0),                          // [7] DeviceKeyType: 0 = DAK
                         serde_cbor::Value::Integer(tpm::DAK_HANDLE as i128),   // [8] DeviceKeyHandle
                         serde_cbor::Value::Integer(tpm::HMAC_KEY_HANDLE as i128), // [9] HMACKeyHandle
+                        // [10] DCMinFirmwareRev: 0 = no minimum (seeding from RV tag 18 not
+                        // implemented; this client does not support RV firmware tags)
+                        serde_cbor::Value::Integer(0),
                     ]);
                     serde_cbor::to_vec(&dctpm_array)
                         .context("Error encoding DCTPM CBOR array")?

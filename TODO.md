@@ -124,7 +124,13 @@ Spec Table 11. Check the templates in `data-formats/src/tpm/key.rs`.
 `tpm/credential.rs` (spec: index MAY be larger than DCTPM; go-fdo now
 defines it at 512). Call sites not compiled here (tpm_support, see T1).
 
-### T5. DCTPM DeviceKeyType holds the protocol key type
+### T6. DCTPM item 10 DCMinFirmwareRev — written as 0, 2026-10-27 (uncompiled, see T1)
+TPM spec ed57e9f adds a required eleventh DCTPM item. `manufacturing-client`
+now writes 0; seeding it from RVMinFirmwareRev (RV tag 18) is not implemented.
+Readers already accept eleven items (`arr.len() >= 8`). The index is still
+defined at the exact structure size (spec: 512 RECOMMENDED, in-place updates).
+
+### T5. DCTPM DeviceKeyType holds the protocol key type — fixed in code 2026-10-27 (uncompiled)
 `manufacturing-client` writes `key_type_value` (the FDO protocol key type,
 e.g. 10 = secp256r1) at DCTPM index 7. The TPM spec defines DeviceKeyType as
 0 = DAK, 1 = IDevID, 2 = LDevID; write 0. go-fdo fixed the same deviation
