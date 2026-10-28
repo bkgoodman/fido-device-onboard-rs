@@ -1064,7 +1064,7 @@ impl KeyReference {
 
             // Create + load + persist HMAC key
             let (hmac_priv, hmac_pub) =
-                key::create_child_hmac_key(&mut ctx, srk)
+                key::create_child_hmac_key(&mut ctx, srk, hash_alg)
                     .context("Error creating child HMAC key")?;
             let hmac_loaded = key::load_child_key(&mut ctx, srk, hmac_priv, hmac_pub)
                 .context("Error loading child HMAC key")?;
@@ -1087,7 +1087,7 @@ impl KeyReference {
             let mut device_key_us = vec![0u8; dk_us_size];
             openssl::rand::rand_bytes(&mut device_key_us)
                 .context("Error generating device key unique string")?;
-            let mut hmac_us = [0u8; 32];
+            let mut hmac_us = vec![0u8; coord_size]; // 32 (SHA-256) or 48 (SHA-384)
             openssl::rand::rand_bytes(&mut hmac_us)
                 .context("Error generating HMAC unique string")?;
 
@@ -1101,7 +1101,7 @@ impl KeyReference {
                 tpm::DAK_HANDLE
             );
 
-            let hmac_transient = key::generate_spec_hmac_key(&mut ctx, &hmac_us)
+            let hmac_transient = key::generate_spec_hmac_key(&mut ctx, hash_alg, &hmac_us)
                 .context("Error creating primary HMAC key")?;
             key::persist_key(&mut ctx, hmac_transient, tpm::HMAC_KEY_HANDLE)
                 .context("Error persisting HMAC key")?;
@@ -1935,7 +1935,9 @@ impl KeyReference {
                     data,
                 )
                 .context("Error computing HMAC with TPM")?;
-                HMac::from_digest(HashType::HmacSha256, hmac_bytes)
+                let hmac_type = fdo_data_formats::tpm::key::hmac_type_for_len(hmac_bytes.len())
+                    .context("Unexpected TPM HMAC length")?;
+                HMac::from_digest(hmac_type, hmac_bytes)
                     .context("Error creating HMac from TPM HMAC")
             }
         }

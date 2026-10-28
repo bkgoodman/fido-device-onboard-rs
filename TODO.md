@@ -124,6 +124,16 @@ Spec Table 11. Check the templates in `data-formats/src/tpm/key.rs`.
 `tpm/credential.rs` (spec: index MAY be larger than DCTPM; go-fdo now
 defines it at 512). Call sites not compiled here (tpm_support, see T1).
 
+### T7. HMAC key follows the Device key — code done 2026-10-28 (uncompiled, see T1)
+TPM spec Table 10: the HMAC key's nameAlg and HMAC scheme hash match the
+Device key (P-384 -> SHA-384, 48-byte unique string). It was always SHA-256.
+`generate_spec_hmac_key` / `create_child_hmac_key` take the hash;
+`hmac_with_persistent_key` passes `Null` (the key's hash) and callers map the
+result length to HmacSha256/HmacSha384 (`hmac_type_for_len`). The Device uses
+its key's hash for every HMAC whatever the Owner's key (base-spec errata
+pending, go-fdo `deviceHashAlg`). Not done: the non-TPM paths and
+`semi_tpm_hmac_key_template` (its nameAlg is still SHA-256).
+
 ### T6. DCTPM item 10 DCMinFirmwareRev — written as 0, 2026-10-27 (uncompiled, see T1)
 TPM spec ed57e9f adds a required eleventh DCTPM item. `manufacturing-client`
 now writes 0; seeding it from RVMinFirmwareRev (RV tag 18) is not implemented.

@@ -136,7 +136,15 @@ pub fn generate_spec_ec_key(
 ///   - Unique field populated with the unique string bytes
 ///
 /// Returns a transient KeyHandle.
-pub fn generate_spec_hmac_key(ctx: &mut Context, unique_string: &[u8]) -> Result<KeyHandle, Error> {
+///
+/// `hash_alg` is the Device key's hash (SHA-256 for P-256, SHA-384 for P-384;
+/// Table 10): it is both nameAlg and the HMAC scheme hash, and the Device uses
+/// it for every HMAC whatever the Owner's key.
+pub fn generate_spec_hmac_key(
+    ctx: &mut Context,
+    hash_alg: HashingAlgorithm,
+    unique_string: &[u8],
+) -> Result<KeyHandle, Error> {
     let obj_attrs = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
@@ -149,10 +157,10 @@ pub fn generate_spec_hmac_key(ctx: &mut Context, unique_string: &[u8]) -> Result
 
     let builder = PublicBuilder::new()
         .with_public_algorithm(tss_esapi::interface_types::algorithm::PublicAlgorithm::KeyedHash)
-        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_name_hashing_algorithm(hash_alg)
         .with_object_attributes(obj_attrs)
         .with_keyed_hash_parameters(PublicKeyedHashParameters::new(KeyedHashScheme::Hmac {
-            hmac_scheme: HmacScheme::new(HashingAlgorithm::Sha256),
+            hmac_scheme: HmacScheme::new(hash_alg),
         }))
         .with_keyed_hash_unique_identifier(Digest::try_from(unique_string)?);
 
@@ -261,9 +269,11 @@ pub fn create_child_ec_key(
 /// The child key is generated from the TPM's RNG (sensitiveDataOrigin=1).
 ///
 /// Returns (Private blob, Public blob) for loading.
+/// `hash_alg` follows the Device key as in `generate_spec_hmac_key`.
 pub fn create_child_hmac_key(
     ctx: &mut Context,
     parent: KeyHandle,
+    hash_alg: HashingAlgorithm,
 ) -> Result<
     (
         tss_esapi::structures::Private,
@@ -283,10 +293,10 @@ pub fn create_child_hmac_key(
 
     let template = PublicBuilder::new()
         .with_public_algorithm(tss_esapi::interface_types::algorithm::PublicAlgorithm::KeyedHash)
-        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_name_hashing_algorithm(hash_alg)
         .with_object_attributes(obj_attrs)
         .with_keyed_hash_parameters(PublicKeyedHashParameters::new(KeyedHashScheme::Hmac {
-            hmac_scheme: HmacScheme::new(HashingAlgorithm::Sha256),
+            hmac_scheme: HmacScheme::new(hash_alg),
         }))
         .with_keyed_hash_unique_identifier(Digest::default())
         .build()?;
@@ -406,10 +416,21 @@ pub fn hmac_with_persistent_key(
 ) -> Result<Vec<u8>, Error> {
     let buffer = tss_esapi::structures::MaxBuffer::try_from(data)?;
 
+    // Null: the hash fixed by the key's scheme, which matches the Device key
+    // (TPM spec Table 10); the Device uses it for every HMAC.
     let result = ctx.execute_with_nullauth_session(|ctx| {
-        ctx.hmac(key_handle.into(), buffer, HashingAlgorithm::Sha256)
+        ctx.hmac(key_handle.into(), buffer, HashingAlgorithm::Null)
     })?;
     Ok(result.to_vec())
+}
+
+/// FDO HMAC type for a result of `hmac_with_persistent_key`, from its length.
+pub fn hmac_type_for_len(len: usize) -> Result<crate::constants::HashType, Error> {
+    match len {
+        32 => Ok(crate::constants::HashType::HmacSha256),
+        48 => Ok(crate::constants::HashType::HmacSha384),
+        _ => Err(Error::UnsupportedAlgorithm),
+    }
 }
 
 /// Extract the public key from TPM Public structure as DER bytes.

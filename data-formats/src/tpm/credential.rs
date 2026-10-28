@@ -10,7 +10,6 @@
 //! is needed — simple null-auth (empty password) is sufficient.
 
 use crate::{
-    constants::HashType,
     devicecredential::DeviceCredential,
     errors::Error,
     tpm::{self, key, nv},
@@ -177,7 +176,7 @@ impl DeviceCredential for TpmDeviceCredential {
         let mut ctx = tpm::open_context()?;
         let hmac_handle = key::load_persistent_signing_key(&mut ctx, tpm::HMAC_KEY_HANDLE)?;
         let computed = key::hmac_with_persistent_key(&mut ctx, hmac_handle, data)?;
-        let computed_hmac = HMac::from_digest(HashType::HmacSha256, computed)?;
+        let computed_hmac = HMac::from_digest(key::hmac_type_for_len(computed.len())?, computed)?;
         if hmac != &computed_hmac {
             Err(Error::IncorrectHash)
         } else {
