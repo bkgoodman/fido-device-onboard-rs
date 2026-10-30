@@ -84,11 +84,10 @@ start_go_server() {
 	done
 
 	log_info "Starting server process..."
-	# -lenient-kex: client-linuxapp always selects ECDH384 instead of choosing
-	# from the HelloDeviceAck20 offer, which is not spec compliant for P-256
-	# keys (see TODO.md P4). Override with GO_SERVER_KEX_FLAGS="" to test the
-	# spec-strict server.
-	flags="${GO_SERVER_KEX_FLAGS--lenient-kex} $flags"
+	# Spec-strict server: client-linuxapp selects its key exchange from the
+	# HelloDeviceAck20 offer (TODO.md P4, fixed 2026-10-30). Set
+	# GO_SERVER_KEX_FLAGS=-lenient-kex to test an older client.
+	flags="${GO_SERVER_KEX_FLAGS-} $flags"
 	# shellcheck disable=SC2086
 	(cd "$GO_FDO_DIR/examples" && go run ./cmd server -http "$SERVER_ADDR" -ext-http "$SERVER_ADDR" -db "$DB_FILE" $flags >$EPHEMERAL_DIR/fdo_server.log 2>&1) &
 	SERVER_PID=$!
@@ -546,7 +545,7 @@ test_bmo_meta_url() {
 		log_success "Raw meta-payload CBOR saved ($(stat --format='%s' $EPHEMERAL_DIR/fdo-bmo-meta/meta_payload.cbor) bytes)"
 	fi
 
-	kill $HTTP_PID 2>/dev/null
+	kill $HTTP_PID 2>/dev/null || true # may have exited already (set -e)
 	stop_server
 	log_success "BMO meta-URL test PASSED"
 }

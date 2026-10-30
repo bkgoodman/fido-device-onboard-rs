@@ -426,7 +426,6 @@ async fn perform_to2(
 
     let mut client = fdo_http_wrapper::client::ServiceClient::new(ProtocolVersion::Version2_0, url);
 
-    let kexsuite = KexSuite::Ecdh384;
     let ciphersuite = CipherSuite::A256Gcm;
     let _sigtype = DeviceSigType::StSECP384R1;
 
@@ -462,6 +461,28 @@ async fn perform_to2(
         .hash_prev()
         .compare_data(&hello_probe_bytes)
         .context("HelloDeviceAck20 hashPrev does not match HelloDeviceProbe")?;
+
+    // The Device selects one of the offered suites: ECDH384, else ECDH256.
+    // (ASYMKEX is deprecated in FDO 2.0, Errata 1 A4; an offer containing it
+    // does not even decode, since KexSuite has no ASYMKEX.)
+    let kexsuite = if hello_ack.kex_suites().iter().any(|k| matches!(k, KexSuite::Ecdh384)) {
+        KexSuite::Ecdh384
+    } else if hello_ack.kex_suites().iter().any(|k| matches!(k, KexSuite::Ecdh256)) {
+        KexSuite::Ecdh256
+    } else {
+        bail!(
+            "Owner offered no supported key exchange suite: {:?} (this client supports ECDH384, ECDH256)",
+            hello_ack.kex_suites()
+        );
+    };
+    log::info!("TO2: key exchange {:?} (Owner offered {:?})", kexsuite, hello_ack.kex_suites());
+    if !hello_ack.cipher_suites().iter().any(|c| matches!(c, CipherSuite::A256Gcm)) {
+        bail!(
+            "Owner offered no supported cipher suite: {:?} (this client supports {:?})",
+            hello_ack.cipher_suites(),
+            ciphersuite
+        );
+    }
 
     // NonceTO2ProveDv: signed in the ProveDevice20 EAT, echoed in Done20
     let nonce_to2_prove_dv_prep = hello_ack.nonce_to2_prove_dv_prep().clone();

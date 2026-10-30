@@ -72,7 +72,12 @@ Only the first rendezvous blob of `TO1.RVRedirect` is used; a partial list
 ### P3. DispDisable not supported
 A `TO2.SetupDevice20` with `DispDisable` fails TO2.
 
-### P4. TO2 key exchange suite is hard-coded to ECDH384
+### P4. TO2 key exchange suite is hard-coded to ECDH384 — FIXED 2026-10-30
+Fixed: `client-linuxapp` picks ECDH384, else ECDH256, from the
+`HelloDeviceAck20` offer (fails if neither is offered; ASYMKEX is deprecated,
+FDO 2.0 Errata 1 A4) and checks A256GCM was offered. `test_rust_fdo20_interop.sh`
+runs against the spec-strict server by default; 7/7 pass.
+Original:
 `client-linuxapp` always sends `ECDH384` in `TO2.ProveDevice20` and ignores
 the suites the Owner offers in `TO2.HelloDeviceAck20`. The spec only allows
 ECDH384 for a P-384 Owner key (ECDH256 for P-256, DHKEX for RSA). go-fdo's
